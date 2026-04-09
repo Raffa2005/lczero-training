@@ -55,10 +55,31 @@ class PolicyHead(nnx.Module):
             rngs=rngs,
         )
 
+        # Second set of projections for ability-activation policy.
+        self.q_ab = nnx.Linear(
+            in_features=embedding_size,
+            out_features=config.d_model,
+            rngs=rngs,
+        )
+
+        self.k_ab = nnx.Linear(
+            in_features=embedding_size,
+            out_features=config.d_model,
+            rngs=rngs,
+        )
+
+        self.promotion_dense_ab = nnx.Linear(
+            in_features=config.d_model,
+            out_features=4,
+            use_bias=False,
+            rngs=rngs,
+        )
+
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.tokens(x)
         x = get_activation(self.activation)(x)
 
+        # --- Normal policy (indices 0-1857) ---
         q = self.q(x)
         k = self.k(x)
         qk = jnp.einsum("qd,kd->qk", q, k)
@@ -88,8 +109,45 @@ class PolicyHead(nnx.Module):
         logits = jnp.concatenate(
             [policy_attn_logits.flatten(), promotion_logits.flatten()], axis=-1
         )
+        normal_policy = logits[_policy_map]
 
-        return logits[_policy_map]
+        # --- Ability-activation policy (indices 1858-3715) ---
+        q_ab = self.q_ab(x)
+        k_ab = self.k_ab(x)
+        qk_ab = jnp.einsum("qd,kd->qk", q_ab, k_ab)
+
+        promotion_keys_ab = k_ab[-8:, :]
+        promotion_offsets_ab = self.promotion_dense_ab(promotion_keys_ab)
+        promotion_offsets_ab = (
+            promotion_offsets_ab.transpose((1, 0)) * self.dk
+        )
+        promotion_offsets_ab = (
+            promotion_offsets_ab[:3, :] + promotion_offsets_ab[3:4, :]
+        )
+
+        n_promo_ab = qk_ab[-16:-8, -8:]
+        q_promo_ab = jnp.expand_dims(
+            n_promo_ab + promotion_offsets_ab[0:1, :], axis=-1
+        )
+        r_promo_ab = jnp.expand_dims(
+            n_promo_ab + promotion_offsets_ab[1:2, :], axis=-1
+        )
+        b_promo_ab = jnp.expand_dims(
+            n_promo_ab + promotion_offsets_ab[2:3, :], axis=-1
+        )
+        promotion_logits_ab = jnp.concatenate(
+            [q_promo_ab, r_promo_ab, b_promo_ab], axis=-1
+        )
+        policy_attn_logits_ab = qk_ab / self.dk
+        promotion_logits_ab = promotion_logits_ab.reshape((8, 24)) / self.dk
+
+        logits_ab = jnp.concatenate(
+            [policy_attn_logits_ab.flatten(), promotion_logits_ab.flatten()],
+            axis=-1,
+        )
+        ability_policy = logits_ab[_policy_map]
+
+        return jnp.concatenate([normal_policy, ability_policy], axis=-1)
 
 
 # fmt: off

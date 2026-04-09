@@ -35,7 +35,7 @@ class ModelPrediction:
 class LczeroModel(nnx.Module):
     def __init__(self, config: model_config_pb2.ModelConfig, *, rngs: nnx.Rngs):
         self.config = config
-        self._input_channels = 112
+        self._input_channels = 114
         deepnorm_beta = math.pow(8.0 * config.encoder.num_blocks, -0.25)
 
         self.embedding = Embedding(

@@ -30,8 +30,8 @@ class TrainingSample:
     Used for vmap over individual samples in loss computation.
 
     Fields:
-        inputs: Input planes tensor [112, 8, 8]
-        probabilities: Policy probabilities tensor [1858]
+        inputs: Input planes tensor [114, 8, 8]
+        probabilities: Policy probabilities tensor [3716]
         values: Combined values tensor [6, 3] where:
             - Index 0: result [result_q, result_d, plies_left]
             - Index 1: best [best_q, best_d, best_m]
@@ -52,8 +52,8 @@ class TrainingBatch:
     """Batch of training data with inputs, probabilities, and values tensors.
 
     Fields:
-        inputs: Input planes tensor [batch, 112, 8, 8]
-        probabilities: Policy probabilities tensor [batch, 1858]
+        inputs: Input planes tensor [batch, 114, 8, 8]
+        probabilities: Policy probabilities tensor [batch, 3716]
         values: Combined values tensor [batch, 6, 3] where:
             - Index 0: result [result_q, result_d, plies_left]
             - Index 1: best [best_q, best_d, best_m]
