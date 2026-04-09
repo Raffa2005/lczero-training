@@ -85,8 +85,8 @@ void TensorGenerator::Worker(std::stop_token stop_token,
 TensorTuple TensorGenerator::ConvertFramesToTensors(
     const std::vector<FrameType>& frames) {
   const size_t batch_size = frames.size();
-  constexpr size_t kNumPlanes = 112;
-  constexpr size_t kNumPolicyMoves = 1858;
+  constexpr size_t kNumPlanes = 114;
+  constexpr size_t kNumPolicyMoves = 3716;
   constexpr size_t kNumValueTypes = 6;
   constexpr size_t kValuesPerType = 3;
 
@@ -188,8 +188,10 @@ void TensorGenerator::ProcessPlanes(const std::vector<FrameType>& frames,
         {107, static_cast<float>(frame.castling_them_oo)},
         {108, static_cast<float>(frame.side_to_move_or_enpassant)},
         {109, static_cast<float>(frame.rule50_count) / 99.0f},
-        {110, 0.0f},  // All zeros (constant plane).
+        {110, static_cast<float>(frame.is_mid_doublemove)},
         {111, 1.0f},  // All ones (constant plane).
+        {112, static_cast<float>(frame.our_doublemove_available)},
+        {113, static_cast<float>(frame.their_doublemove_available)},
     };
 
     for (const auto& [plane_num, value] : meta_planes) {
