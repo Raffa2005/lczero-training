@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 
+import jax
 import orbax.checkpoint as ocp
 from flax import nnx
 from google.protobuf import text_format
@@ -57,10 +58,17 @@ def train(config_filename: str) -> None:
         model_config=config.model,
         training_config=config.training,
     )
-    logging.info("Restoring checkpoint")
-    training_state = checkpoint_mgr.restore(
-        None, args=ocp.args.PyTreeRestore(empty_state)
-    )
+    latest_step = checkpoint_mgr.latest_step()
+    if latest_step is not None:
+        logging.info("Restoring checkpoint at step %s", latest_step)
+        training_state = checkpoint_mgr.restore(
+            latest_step, args=ocp.args.PyTreeRestore(empty_state)
+        )
+    else:
+        logging.info("No checkpoint found, starting from scratch")
+        # Deep-copy to ensure model_state and swa_state are separate buffers,
+        # since JAX donation fails if the same buffer appears twice.
+        training_state = jax.tree.map(lambda x: x.copy() if hasattr(x, 'copy') else x, empty_state)
     logging.info("Restored checkpoint")
 
     model, _ = nnx.split(
@@ -89,6 +97,15 @@ def train(config_filename: str) -> None:
         from_dataloader(make_dataloader(config.data_loader)),
         config.training.schedule.steps_per_network,
     )
+
+    training_state = training_state.replace(jit_state=new_state)
+    logging.info("Saving checkpoint at step %d", new_state.step)
+    checkpoint_mgr.save(
+        step=new_state.step,
+        args=ocp.args.PyTreeSave(item=training_state),
+    )
+    checkpoint_mgr.wait_until_finished()
+    logging.info("Checkpoint saved")
 
     if config.export.destination_filename:
         date_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")

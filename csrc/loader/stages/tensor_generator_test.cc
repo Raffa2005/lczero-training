@@ -58,8 +58,8 @@ class TensorGeneratorTest : public ::testing::Test {
     frame.input_format = 3;
 
     // Fill probabilities with test values.
-    for (ssize_t i = 0; i < 1858; ++i) {
-      frame.probabilities[i] = static_cast<float>(i) / 1858.0f;
+    for (ssize_t i = 0; i < 3716; ++i) {
+      frame.probabilities[i] = static_cast<float>(i) / 3716.0f;
     }
 
     // Fill planes with test pattern.
@@ -101,7 +101,7 @@ class TensorGeneratorTest : public ::testing::Test {
     ASSERT_NE(planes_tensor, nullptr);
     EXPECT_EQ(planes_tensor->shape().size(), 4);
     EXPECT_EQ(planes_tensor->shape()[0], batch_size);
-    EXPECT_EQ(planes_tensor->shape()[1], 112);
+    EXPECT_EQ(planes_tensor->shape()[1], 114);
     EXPECT_EQ(planes_tensor->shape()[2], 8);
     EXPECT_EQ(planes_tensor->shape()[3], 8);
 
@@ -111,7 +111,7 @@ class TensorGeneratorTest : public ::testing::Test {
     ASSERT_NE(probs_tensor, nullptr);
     EXPECT_EQ(probs_tensor->shape().size(), 2);
     EXPECT_EQ(probs_tensor->shape()[0], batch_size);
-    EXPECT_EQ(probs_tensor->shape()[1], 1858);
+    EXPECT_EQ(probs_tensor->shape()[1], 3716);
 
     // Verify values tensor: (batch_size, 6, 3)
     const auto* values_tensor =
@@ -138,7 +138,7 @@ class TensorGeneratorTest : public ::testing::Test {
 
       // Verify probabilities data.
       auto probs_slice = probs_tensor->slice({static_cast<ssize_t>(i)});
-      for (ssize_t j = 0; j < 1858; ++j) {
+      for (ssize_t j = 0; j < 3716; ++j) {
         EXPECT_FLOAT_EQ(probs_slice[j], frame.probabilities[j]);
       }
 
