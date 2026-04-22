@@ -36,7 +36,24 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _enable_jax_persistent_cache() -> None:
+    # Persist XLA HLO compilation across train runs. Each `lc0-train` invocation
+    # starts a fresh Python process, so without this the train_step is
+    # JIT-compiled from scratch every iteration (~8s on T4). The cache lives at
+    # $LC0_JAX_CACHE_DIR or ~/.cache/lczero-jax-jit by default.
+    cache_dir = os.environ.get(
+        "LC0_JAX_CACHE_DIR",
+        os.path.join(os.path.expanduser("~"), ".cache", "lczero-jax-jit"),
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", cache_dir)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+    logging.info("JAX persistent compilation cache: %s", cache_dir)
+
+
 def train(config_filename: str) -> None:
+    _enable_jax_persistent_cache()
     config = RootConfig()
     logging.info("Reading configuration from proto file")
     with open(config_filename, "r") as f:
