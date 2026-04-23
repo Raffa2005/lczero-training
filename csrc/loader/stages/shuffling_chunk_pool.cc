@@ -208,10 +208,12 @@ ShufflingChunkPool::InitializeChunkSources() {
             [](const auto& a, const auto& b) {
               return a->GetChunkSortKey() > b->GetChunkSortKey();
             });
-  std::atomic<size_t> total_chunks = 0;
+  size_t total_chunks = 0;
+  size_t total_window_units = 0;
   size_t sources_to_keep = 0;
 
-  // Process sources sequentially until we have enough chunks.
+  // Process sources sequentially until we have enough window units (e.g.
+  // positions for raw selfplay files).
   std::string current_anchor;
   {
     absl::MutexLock lock(&anchor_mutex_);
@@ -223,29 +225,32 @@ ShufflingChunkPool::InitializeChunkSources() {
       LOG(INFO) << "Output queue closed, stopping source ingestion.";
       break;
     }
-    if (total_chunks >= chunk_pool_size_) break;
+    if (total_window_units >= chunk_pool_size_) break;
 
-    // Count chunks immediately; constructors have already prepared metadata.
     const size_t chunk_count = source->GetChunkCount();
+    const size_t window_units = source->GetWindowUnits();
     total_chunks += chunk_count;
+    total_window_units += window_units;
 
     // Count chunks since anchor during initial load.
     if (source->GetChunkSortKey() > current_anchor) {
       chunks_since_anchor_ += chunk_count;
     }
 
-    LOG_EVERY_N_SEC(INFO, 4) << "Loaded so far: " << total_chunks.load()
-                             << "; new: " << chunks_since_anchor_;
+    LOG_EVERY_N_SEC(INFO, 4) << "Loaded so far: " << total_chunks
+                             << " chunk(s), " << total_window_units
+                             << " window unit(s); new: "
+                             << chunks_since_anchor_;
     ++sources_to_keep;
   }
 
-  LOG(INFO) << "ShufflingChunkPool indexed " << total_chunks.load()
-            << " chunk(s) across " << sources_to_keep
-            << " source(s) during startup.";
+  LOG(INFO) << "ShufflingChunkPool indexed " << total_chunks
+            << " chunk(s) across " << sources_to_keep << " source(s) and "
+            << total_window_units << " window unit(s) during startup.";
 
-  if (total_chunks < chunk_pool_size_ && !output_queue()->IsClosed()) {
-    LOG(ERROR) << "ShufflingChunkPool startup chunk requirement not met: "
-               << total_chunks.load() << " < " << chunk_pool_size_;
+  if (total_window_units < chunk_pool_size_ && !output_queue()->IsClosed()) {
+    LOG(ERROR) << "ShufflingChunkPool startup window requirement not met: "
+               << total_window_units << " < " << chunk_pool_size_;
   }
 
   // Trim the vector to only keep the sources we need.
@@ -258,6 +263,7 @@ void ShufflingChunkPool::ProcessInputFiles(
   // Initialize chunk sources from the initial scan.
   size_t initial_window_sources = 0;
   size_t initial_total_chunks = 0;
+  size_t initial_window_units = 0;
   {
     absl::MutexLock lock(&chunk_sources_mutex_);
     size_t start_chunk_index = 0;
@@ -267,6 +273,7 @@ void ShufflingChunkPool::ProcessInputFiles(
                     const size_t count = source->GetChunkCount();
                     auto item = std::make_shared<ChunkSourceItem>();
                     item->start_chunk_index = start_chunk_index;
+                    item->window_units = source->GetWindowUnits();
                     item->source = std::move(source);
                     item->use_counts = std::vector<uint16_t>(count, 0);
                     item->weight = std::vector<float>(count, -1.0f);
@@ -277,23 +284,27 @@ void ShufflingChunkPool::ProcessInputFiles(
                         chunk_sources_.back()->source->GetChunkCount();
                   });
 
-    // Initialize stream shuffler with the initial bounds.
+    // Initialize stream shuffler with the initial bounds. Retention is by
+    // window units (positions for raw files), so the lower bound is just the
+    // start of the first source in the deque — InitializeChunkSources already
+    // dropped older sources that fell outside the window.
     if (!chunk_sources_.empty()) {
       size_t total_chunks = chunk_sources_.back()->start_chunk_index +
                             chunk_sources_.back()->source->GetChunkCount();
-      // Set bounds to provide the last chunk_pool_size_ chunks.
-      size_t lower_bound =
-          total_chunks > chunk_pool_size_ ? total_chunks - chunk_pool_size_ : 0;
-      stream_shuffler_.SetLowerBound(lower_bound);
+      stream_shuffler_.SetLowerBound(chunk_sources_.front()->start_chunk_index);
       stream_shuffler_.SetUpperBound(total_chunks);
       initial_total_chunks = total_chunks;
+      for (const auto& item : chunk_sources_) {
+        initial_window_units += item->window_units;
+      }
     }
     initial_window_sources = chunk_sources_.size();
   }
 
   LOG(INFO) << "ShufflingChunkPool initial window ready with "
             << initial_window_sources << " source(s) totaling "
-            << initial_total_chunks << " chunk(s).";
+            << initial_total_chunks << " chunk(s) and "
+            << initial_window_units << " window unit(s).";
 
   // Log anchor and sources after initial scan completion.
   {
@@ -668,6 +679,7 @@ void ShufflingChunkPool::AddNewChunkSource(std::unique_ptr<ChunkSource> source)
   size_t count = source->GetChunkCount();
   auto item = std::make_shared<ChunkSourceItem>();
   item->start_chunk_index = old_upper_bound;
+  item->window_units = source->GetWindowUnits();
   item->source = std::move(source);
   item->use_counts = std::vector<uint16_t>(count, 0);
   item->weight = std::vector<float>(count, -1.0f);
@@ -680,15 +692,15 @@ void ShufflingChunkPool::AddNewChunkSource(std::unique_ptr<ChunkSource> source)
   // Calculate current window bounds.
   size_t new_upper_bound = chunk_sources_.back()->start_chunk_index +
                            chunk_sources_.back()->source->GetChunkCount();
+  size_t current_window_units = 0;
+  for (const auto& existing : chunk_sources_) {
+    current_window_units += existing->window_units;
+  }
 
-  // Remove old chunks if window exceeds chunk_pool_size_.
-  while (!chunk_sources_.empty() && chunk_sources_.size() > 1) {
-    size_t window_start = chunk_sources_.front()->start_chunk_index +
-                          chunk_sources_.front()->source->GetChunkCount();
-    size_t window_size = new_upper_bound - window_start;
-
-    if (window_size < chunk_pool_size_) break;
-
+  // Evict oldest sources while the window-unit total exceeds the configured
+  // pool size. Always keep at least one source.
+  while (chunk_sources_.size() > 1 &&
+         current_window_units > chunk_pool_size_) {
     // Count cached positions in the evicted source.
     if (cachehit_output_queue_.has_value()) {
       size_t evicted_cached = 0;
@@ -703,17 +715,16 @@ void ShufflingChunkPool::AddNewChunkSource(std::unique_ptr<ChunkSource> source)
       cached_positions_.fetch_sub(evicted_cached, std::memory_order_acq_rel);
     }
 
-    // Remove the oldest chunk source (front of deque).
+    current_window_units -= chunk_sources_.front()->window_units;
     chunk_sources_.pop_front();
   }
 
-  // Update stream shuffler bounds with the sliding window.
+  // Update stream shuffler bounds with the sliding window. Lower bound is
+  // simply the start of the oldest retained source — eviction above already
+  // implements the window-unit policy.
   size_t window_start = chunk_sources_.front()->start_chunk_index;
-  size_t new_lower_bound = new_upper_bound > chunk_pool_size_
-                               ? new_upper_bound - chunk_pool_size_
-                               : window_start;
   stream_shuffler_.SetUpperBound(new_upper_bound);
-  stream_shuffler_.SetLowerBound(new_lower_bound);
+  stream_shuffler_.SetLowerBound(window_start);
 }
 
 StageMetricProto ShufflingChunkPool::FlushMetrics() {
@@ -755,6 +766,16 @@ StageMetricProto ShufflingChunkPool::FlushMetrics() {
     current_chunks_metric->set_name("chunks_current");
     current_chunks_metric->set_value(static_cast<uint64_t>(current));
     current_chunks_metric->set_capacity(
+        static_cast<uint64_t>(chunk_pool_size_));
+
+    uint64_t current_window_units = 0;
+    for (const auto& item : chunk_sources_) {
+      current_window_units += item->window_units;
+    }
+    auto* current_window_metric = stage_metric.add_gauge_metrics();
+    current_window_metric->set_name("window_units_current");
+    current_window_metric->set_value(current_window_units);
+    current_window_metric->set_capacity(
         static_cast<uint64_t>(chunk_pool_size_));
 
     auto* total_chunks_metric = stage_metric.add_gauge_metrics();

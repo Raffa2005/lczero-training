@@ -64,6 +64,7 @@ class ShufflingChunkPool : public Stage {
   struct ChunkSourceItem {
     mutable absl::Mutex mutex;
     size_t start_chunk_index;
+    size_t window_units;
     std::unique_ptr<ChunkSource> source;
     absl::flat_hash_set<size_t> dropped_chunks ABSL_GUARDED_BY(mutex);
     // Per-chunk counters and cached weights.

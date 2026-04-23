@@ -1,10 +1,15 @@
 #include "loader/stages/chunk_source_loader.h"
 
+#include <absl/cleanup/cleanup.h>
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
+#include <vector>
 
+#include "loader/chunk_source/rawfile_chunk_source.h"
 #include "loader/stages/file_path_provider.h"
+#include "trainingdata/trainingdata_v6.h"
 #include "utils/queue.h"
 
 namespace lczero {
@@ -193,6 +198,57 @@ TEST(ChunkSourceLoaderTest, SentinelBarrierWithMultipleThreads) {
   EXPECT_EQ(files_before_sentinel, 0);
   // All 10 post-sentinel files should be after sentinel (unsupported, so 0).
   EXPECT_EQ(files_after_sentinel, 0);
+}
+
+TEST(ChunkSourceLoaderTest, RawFileChunkSourceUsesFrameCountForWindowUnits) {
+  const auto path = std::filesystem::temp_directory_path() /
+                    "rawfile_chunk_source_window_units.bin";
+  std::error_code error;
+  std::filesystem::remove(path, error);
+  absl::Cleanup cleanup = [&] { std::filesystem::remove(path, error); };
+
+  std::vector<V6TrainingData> frames(3);
+  std::ofstream file(path, std::ios::binary);
+  ASSERT_TRUE(file.is_open());
+  file.write(reinterpret_cast<const char*>(frames.data()),
+             static_cast<std::streamsize>(frames.size() * sizeof(frames[0])));
+  file.close();
+
+  RawFileChunkSource raw_source(path, ChunkSourceLoaderConfig::V6TrainingData);
+  ChunkSource& source = raw_source;
+  EXPECT_EQ(source.GetChunkCount(), 1u);
+  EXPECT_EQ(source.GetWindowUnits(), 3u);
+}
+
+TEST(ChunkSourceLoaderTest, RawGzipWindowAccountingUsesFooterISize) {
+  const auto path = std::filesystem::temp_directory_path() /
+                    "rawfile_chunk_source_window_units.gz";
+  std::error_code error;
+  std::filesystem::remove(path, error);
+  absl::Cleanup cleanup = [&] { std::filesystem::remove(path, error); };
+
+  // Real gzip files would have a header + DEFLATE stream, but for window
+  // accounting only the trailing 4-byte ISIZE matters. Synthesize a file
+  // with a dummy body and a hand-written footer claiming kFrames frames.
+  constexpr size_t kFrames = 3;
+  const uint32_t raw_size = kFrames * sizeof(V6TrainingData);
+  std::ofstream file(path, std::ios::binary);
+  ASSERT_TRUE(file.is_open());
+  const std::string padding(8, 'x');
+  file.write(padding.data(), static_cast<std::streamsize>(padding.size()));
+  const char footer[4] = {
+      static_cast<char>(raw_size & 0xff),
+      static_cast<char>((raw_size >> 8) & 0xff),
+      static_cast<char>((raw_size >> 16) & 0xff),
+      static_cast<char>((raw_size >> 24) & 0xff),
+  };
+  file.write(footer, sizeof(footer));
+  file.close();
+
+  RawFileChunkSource raw_source(path, ChunkSourceLoaderConfig::V6TrainingData);
+  ChunkSource& source = raw_source;
+  EXPECT_EQ(source.GetChunkCount(), 1u);
+  EXPECT_EQ(source.GetWindowUnits(), kFrames);
 }
 
 }  // namespace training

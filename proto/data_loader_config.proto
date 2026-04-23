@@ -59,7 +59,11 @@ message PositionSamplingConfig {
 // loading. Maps to ShufflingChunkPoolOptions in
 // csrc/loader/chunk_feed/shuffling_chunk_pool.h
 message ShufflingChunkPoolConfig {
-  // Size of the chunk shuffle buffer.
+  // Size of the source retention window. Most chunk sources contribute one
+  // unit per chunk, so this is effectively a chunk count. Sources backed by
+  // raw selfplay files (RawFileChunkSource) contribute their frame count
+  // instead, so this field controls the retained position count for those
+  // — a long game and a short game no longer count the same.
   optional uint64 chunk_pool_size = 1 [default = 100000];
   // Threads for ingesting new chunk sources (lightweight).
   optional uint64 source_ingestion_threads = 3 [default = 1];

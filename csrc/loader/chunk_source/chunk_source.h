@@ -25,6 +25,13 @@ class ChunkSource {
   // Returns the number of chunks in this source.
   virtual size_t GetChunkCount() const = 0;
 
+  // Returns the size this source contributes to the retention window. The
+  // default is one unit per chunk (matches the historic behaviour of bucketing
+  // by chunk count). Sources backed by raw selfplay files override this to
+  // report frame (position) count, so a long game does not count the same as a
+  // short one when sliding the retention window.
+  virtual size_t GetWindowUnits() const { return GetChunkCount(); }
+
   // Returns the data for the chunk at the given index. Returns std::nullopt if
   // the chunk could not be read or if the data size is not a multiple of the
   // expected frame size.

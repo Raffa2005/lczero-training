@@ -51,11 +51,15 @@ class PassthroughStage : public Stage {
 // Mock ChunkSource for testing
 class MockChunkSource : public ChunkSource {
  public:
-  MockChunkSource(const std::string& sort_key, size_t chunk_count)
-      : sort_key_(sort_key), chunk_count_(chunk_count) {}
+  MockChunkSource(const std::string& sort_key, size_t chunk_count,
+                  size_t window_units = 0)
+      : sort_key_(sort_key),
+        chunk_count_(chunk_count),
+        window_units_(window_units == 0 ? chunk_count : window_units) {}
 
   std::string GetChunkSortKey() const override { return sort_key_; }
   size_t GetChunkCount() const override { return chunk_count_; }
+  size_t GetWindowUnits() const override { return window_units_; }
 
   std::optional<std::vector<FrameType>> GetChunkData(size_t index) override {
     if (index >= chunk_count_) {
@@ -70,6 +74,7 @@ class MockChunkSource : public ChunkSource {
  private:
   std::string sort_key_;
   size_t chunk_count_;
+  size_t window_units_;
 };
 
 class InvalidChunkSource : public ChunkSource {
@@ -113,9 +118,11 @@ class ShufflingChunkPoolTest : public ::testing::Test {
   void AddMockChunkSourceToQueue(const std::string& sort_key,
                                  size_t chunk_count,
                                  FilePathProvider::MessageType message_type =
-                                     FilePathProvider::MessageType::kFile) {
+                                     FilePathProvider::MessageType::kFile,
+                                 size_t window_units = 0) {
     ChunkSourceWithPhase item;
-    item.source = std::make_unique<MockChunkSource>(sort_key, chunk_count);
+    item.source =
+        std::make_unique<MockChunkSource>(sort_key, chunk_count, window_units);
     item.message_type = message_type;
     input_producer_->Put(std::move(item));
   }
@@ -216,9 +223,14 @@ TEST_F(ShufflingChunkPoolTest, FlushMetricsHandlesEmptyChunkSources) {
   auto metrics = shuffling_chunk_pool.FlushMetrics();
   bool found_current = false;
   bool found_total = false;
+  bool found_window_units = false;
   for (const auto& metric : metrics.gauge_metrics()) {
     if (metric.name() == "chunks_current") {
       found_current = true;
+      EXPECT_EQ(metric.value(), 0u);
+      EXPECT_EQ(metric.capacity(), static_cast<uint64_t>(chunk_pool_size));
+    } else if (metric.name() == "window_units_current") {
+      found_window_units = true;
       EXPECT_EQ(metric.value(), 0u);
       EXPECT_EQ(metric.capacity(), static_cast<uint64_t>(chunk_pool_size));
     } else if (metric.name() == "chunks_total") {
@@ -229,6 +241,8 @@ TEST_F(ShufflingChunkPoolTest, FlushMetricsHandlesEmptyChunkSources) {
 
   EXPECT_TRUE(found_current)
       << "FlushMetrics should emit chunks_current metric when empty.";
+  EXPECT_TRUE(found_window_units)
+      << "FlushMetrics should emit window_units_current metric when empty.";
   EXPECT_TRUE(found_total)
       << "FlushMetrics should emit chunks_total metric when empty.";
 }
@@ -275,6 +289,53 @@ TEST_F(ShufflingChunkPoolTest, FlushMetricsReportsWindowAndTotalCounts) {
   EXPECT_EQ(current_count, 30u);
   EXPECT_EQ(current_capacity, static_cast<uint64_t>(chunk_pool_size));
   EXPECT_EQ(total_count, 30u);
+
+  CloseInputQueue();
+}
+
+TEST_F(ShufflingChunkPoolTest, StartupRetentionUsesWindowUnits) {
+  // Five sources, each one chunk but reporting four window units (e.g. four
+  // training frames per chunk). With chunk_pool_size = 10, startup keeps
+  // sources newest-first until total window units >= chunk_pool_size; the
+  // last added source can push the total past the target. Three sources × 4
+  // = 12 units (the loop adds the third because total was still 8 < 10
+  // before the add).
+  AddMockChunkSourceToQueue("source1", 1,
+                            FilePathProvider::MessageType::kFile, 4);
+  AddMockChunkSourceToQueue("source2", 1,
+                            FilePathProvider::MessageType::kFile, 4);
+  AddMockChunkSourceToQueue("source3", 1,
+                            FilePathProvider::MessageType::kFile, 4);
+  AddMockChunkSourceToQueue("source4", 1,
+                            FilePathProvider::MessageType::kFile, 4);
+  AddMockChunkSourceToQueue("source5", 1,
+                            FilePathProvider::MessageType::kFile, 4);
+  MarkInitialScanComplete();
+
+  const int chunk_pool_size = 10;
+  ShufflingChunkPool shuffling_chunk_pool(MakeConfig(chunk_pool_size));
+  shuffling_chunk_pool.SetInputs({input_queue_.get()});
+  shuffling_chunk_pool.Start();
+
+  uint64_t current_window_units = 0;
+  bool found = false;
+  for (int attempt = 0; attempt < 50 && !found; ++attempt) {
+    auto metrics = shuffling_chunk_pool.FlushMetrics();
+    for (const auto& metric : metrics.gauge_metrics()) {
+      if (metric.name() == "window_units_current" && metric.value() > 0) {
+        current_window_units = metric.value();
+        found = true;
+        break;
+      }
+    }
+    if (!found) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(found);
+  // Three newest sources retained = 12 units (overshoots pool_size by one
+  // source-worth, which is the existing startup behaviour). Crucially, the
+  // two oldest sources are excluded — old chunk-count behaviour would have
+  // kept all five (since chunk_count <= pool_size).
+  EXPECT_EQ(current_window_units, 12u);
 
   CloseInputQueue();
 }

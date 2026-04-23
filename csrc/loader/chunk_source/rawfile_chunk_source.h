@@ -20,10 +20,12 @@ class RawFileChunkSource : public ChunkSource {
  private:
   std::string GetChunkSortKey() const override;
   size_t GetChunkCount() const override;
+  size_t GetWindowUnits() const override;
   std::optional<std::vector<FrameType>> GetChunkData(size_t index) override;
 
   std::string filename_;
   ChunkSourceLoaderConfig::FrameFormat frame_format_;
+  size_t window_units_ = 1;
 };
 
 }  // namespace training
