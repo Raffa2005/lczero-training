@@ -132,9 +132,12 @@ class LczeroLoss:
         self,
         model: LczeroModel,
         sample: TrainingSample,
+        step: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-        # Run model forward pass.
-        predictions = model(sample.inputs)
+        # Run model forward pass. `step` is forwarded so policy heads with
+        # gradient gating (doublemove_grad_gate_step) can decide whether to
+        # block ability-head gradients into the encoder this step.
+        predictions = model(sample.inputs, step=step)
 
         unweighted_losses: Dict[str, jax.Array] = {}
         weighted_losses: List[jax.Array] = []

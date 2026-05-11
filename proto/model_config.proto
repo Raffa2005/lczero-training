@@ -13,6 +13,15 @@ message ModelConfig {
   repeated PolicyHeadConfig policy_head = 8;
   repeated ValueHeadConfig value_head = 9;
   repeated MovesLeftHeadConfig movesleft_head = 10;
+  // For doubled-policy networks: absolute training step at which gradient
+  // flow from the ability policy projections (q_ab/k_ab/promotion_dense_ab)
+  // into the shared encoder is unblocked. Below this step, the ability
+  // projections read stop_gradient(encoder_output), so their own parameters
+  // still train via policy CE but they do NOT corrupt upstream weights.
+  // 0 disables gating (full backprop from step 0). Pure training-time knob;
+  // ignored at inference. The smoke test should clear this field before
+  // comparing the trainee config with leela_to_modelconfig output.
+  optional uint64 doublemove_grad_gate_step = 11;
 }
 
 message DefaultsConfig {

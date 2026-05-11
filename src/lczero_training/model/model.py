@@ -36,6 +36,10 @@ class LczeroModel(nnx.Module):
     def __init__(self, config: model_config_pb2.ModelConfig, *, rngs: nnx.Rngs):
         self.config = config
         self._input_channels = 114
+        # Doubled-policy gradient gate (training-time only). 0 = always open.
+        # Stored as a plain Python int — passed into PolicyHead.__call__ so
+        # the gate threshold itself is not a traced value (only `step` is).
+        self._ability_grad_gate_step = int(config.doublemove_grad_gate_step)
         deepnorm_beta = math.pow(8.0 * config.encoder.num_blocks, -0.25)
 
         self.embedding = Embedding(
@@ -106,7 +110,9 @@ class LczeroModel(nnx.Module):
             }
         )
 
-    def __call__(self, x: jax.Array) -> ModelPrediction:
+    def __call__(
+        self, x: jax.Array, step: Optional[jax.Array] = None
+    ) -> ModelPrediction:
         x = jnp.astype(x, get_dtype(self.config.defaults.compute_dtype))
         x = jnp.transpose(x, (1, 2, 0))
         x = jnp.reshape(x, (64, self._input_channels))
@@ -114,7 +120,14 @@ class LczeroModel(nnx.Module):
         x = self.encoders(x)
 
         value = {name: head(x) for name, head in self.value_heads.items()}
-        policy = {name: head(x) for name, head in self.policy_heads.items()}
+        policy = {
+            name: head(
+                x,
+                step=step,
+                ability_grad_gate_step=self._ability_grad_gate_step,
+            )
+            for name, head in self.policy_heads.items()
+        }
         movesleft = {
             name: head(x) for name, head in self.movesleft_heads.items()
         }

@@ -2,7 +2,7 @@ import dataclasses
 import gzip
 import logging
 import math
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 import jax.numpy as jnp
 from flax import nnx, serialization
@@ -85,13 +85,106 @@ class LeelaToJax(LeelaPytreeWeightsVisitor):
     def embedding_block(
         self, nnx_dict: nnx.State, weights: net_pb2.Weights
     ) -> None:
-        super().embedding_block(nnx_dict=nnx_dict, weights=weights)
+        # Replicates super().embedding_block(...) with the embedding-kernel
+        # matmul replaced by _extend_embedding_kernel: standard lc0 oracles
+        # have 112 input planes, doublemove trainee has 114 (planes 112-113
+        # carry "our/their ability available"). Splice 2 zero rows between
+        # the standard-plane rows and the positional-encoding rows.
+        self.matmul(
+            nnx_dict["preprocess"],
+            weights.ip_emb_preproc_w,
+            weights.ip_emb_preproc_b,
+        )
+        self._extend_embedding_kernel(
+            nnx_dict["embedding"]["kernel"], weights.ip_emb_w
+        )
+        self.tensor(nnx_dict["embedding"]["bias"], weights.ip_emb_b)
+        self.layernorm(
+            nnx_dict["norm"],
+            weights.ip_emb_ln_gammas,
+            weights.ip_emb_ln_betas,
+        )
+        self.tensor(
+            nnx_dict["ma_gating"]["mult_gate"]["gate"], weights.ip_mult_gate
+        )
+        self.tensor(
+            nnx_dict["ma_gating"]["add_gate"]["gate"], weights.ip_add_gate
+        )
+        self.ffn(nnx_dict["ffn"], weights.ip_emb_ffn)
+        self.layernorm(
+            nnx_dict["out_norm"],
+            weights.ip_emb_ffn_ln_gammas,
+            weights.ip_emb_ffn_ln_betas,
+        )
+
+        # Plane 109 (rule50) lives in [0..111] so the splice doesn't move
+        # it. Same scaling as before.
         embedding_kernel = cast(nnx.Param, nnx_dict["embedding"]["kernel"])
         values = embedding_kernel.value
         scaled_values = values.at[_EMBEDDING_PLANE_TO_SCALE].set(
             values[_EMBEDDING_PLANE_TO_SCALE] * _EMBEDDING_SCALE
         )
         embedding_kernel.value = scaled_values
+
+    def _extend_embedding_kernel(
+        self,
+        kernel_param: Any,
+        oracle_layer: net_pb2.Weights.Layer,
+    ) -> None:
+        """Load oracle ip_emb_w with 2 zero-init rows for ability planes.
+
+        Oracle kernel shape: (112 + dense_size, embedding_size).
+        Trainee kernel shape: (114 + dense_size, embedding_size).
+
+        Layout after splice (rows = input features):
+            rows 0..111      ← oracle rows 0..111   (standard planes)
+            rows 112..113    ← zeros                (ability planes — new)
+            rows 114..114+ds ← oracle rows 112..    (dense positional rows)
+
+        Bias is unaffected (its shape is (embedding_size,)).
+        """
+        trainee_in, embedding_size = kernel_param.shape
+        oracle_total = len(oracle_layer.params) // 2
+        assert oracle_total != 0, "Oracle ip_emb_w is empty"
+        assert oracle_total % embedding_size == 0, (
+            f"Oracle ip_emb_w has {oracle_total} values, not divisible by "
+            f"embedding_size={embedding_size}"
+        )
+        oracle_in = oracle_total // embedding_size
+        assert oracle_in >= 112, (
+            f"Oracle ip_emb_w has {oracle_in} input rows; expected >=112"
+        )
+        dense_size = oracle_in - 112
+        assert trainee_in == 114 + dense_size, (
+            f"Trainee embedding kernel input dim is {trainee_in}; "
+            f"expected 114 + dense_size = {114 + dense_size} "
+            f"(dense_size derived from oracle = {dense_size})"
+        )
+
+        # Decode oracle weights identically to the base tensor():
+        # uint16 LINEAR16 → float32 → reshape (out, in).T → (in, out).
+        raw = jnp.frombuffer(oracle_layer.params, dtype=jnp.uint16).astype(
+            jnp.float32
+        )
+        alpha = raw / 65535.0
+        decoded = (
+            alpha * oracle_layer.max_val
+            + (1.0 - alpha) * oracle_layer.min_val
+        )
+        oracle_kernel = decoded.reshape(embedding_size, oracle_in).transpose()
+
+        zeros = jnp.zeros((2, embedding_size), dtype=oracle_kernel.dtype)
+        new_kernel = jnp.concatenate(
+            [
+                oracle_kernel[:112],   # standard planes 0..111
+                zeros,                 # ability planes 112, 113 (zero-init)
+                oracle_kernel[112:],   # dense positional rows 114..
+            ],
+            axis=0,
+        )
+        assert new_kernel.shape == kernel_param.shape
+
+        kernel_param.value = new_kernel.astype(kernel_param.dtype)
 
     def tensor(
         self,

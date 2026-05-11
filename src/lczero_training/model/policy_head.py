@@ -75,7 +75,12 @@ class PolicyHead(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array) -> jax.Array:
+    def __call__(
+        self,
+        x: jax.Array,
+        step: Optional[jax.Array] = None,
+        ability_grad_gate_step: int = 0,
+    ) -> jax.Array:
         x = self.tokens(x)
         x = get_activation(self.activation)(x)
 
@@ -112,8 +117,21 @@ class PolicyHead(nnx.Module):
         normal_policy = logits[_policy_map]
 
         # --- Ability-activation policy (indices 1858-3715) ---
-        q_ab = self.q_ab(x)
-        k_ab = self.k_ab(x)
+        # Gate gradient flow from the ability projections back into the shared
+        # encoder. While `step < ability_grad_gate_step`, the ability head sees
+        # stop_gradient(x): q_ab/k_ab/promotion_dense_ab still update from
+        # policy CE, but their gradient does NOT propagate into tokens / encoder
+        # / embedding. This protects pretrained upstream weights from being
+        # dragged off-distribution by random ability priors during the warm-up
+        # window. After the gate opens, full backprop resumes.
+        if ability_grad_gate_step > 0 and step is not None:
+            gate_open = (step >= ability_grad_gate_step).astype(x.dtype)
+            x_ab = gate_open * x + (1.0 - gate_open) * jax.lax.stop_gradient(x)
+        else:
+            x_ab = x
+
+        q_ab = self.q_ab(x_ab)
+        k_ab = self.k_ab(x_ab)
         qk_ab = jnp.einsum("qd,kd->qk", q_ab, k_ab)
 
         promotion_keys_ab = k_ab[-8:, :]
