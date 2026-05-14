@@ -102,16 +102,10 @@ class Training:
         ) -> Tuple[JitTrainingState, MetricsDict]:
             model = nnx.merge(graphdef, jit_state.model_state)
 
-            # Capture jit_state.step in the closure so the loss can forward it
-            # into the model. This is the doubled-policy gradient gate signal
-            # (PolicyHead reads it to decide whether to stop_gradient through
-            # the ability projections back into the shared encoder).
-            current_step = jit_state.step
-
             def loss_for_grad(
                 model_arg: LczeroModel, sample_arg: TrainingSample
             ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-                return loss_fn(model_arg, sample_arg, step=current_step)
+                return loss_fn(model_arg, sample_arg)
 
             loss_vfn = jax.vmap(
                 loss_for_grad,

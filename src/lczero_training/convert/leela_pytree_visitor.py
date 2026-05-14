@@ -143,14 +143,48 @@ class LeelaPytreeWeightsVisitor:
         # pretrained encoder through backprop.  The ability head can then
         # learn the *difference* between normal and double-move play.
         if "q_ab" in nnx_dict:
+            if weights.HasField("ip2_pol_ab_w") and weights.HasField(
+                "ip2_pol_ab_b"
+            ):
+                self.matmul(
+                    nnx_dict["q_ab"],
+                    weights.ip2_pol_ab_w,
+                    weights.ip2_pol_ab_b,
+                )
+                self.matmul(
+                    nnx_dict["k_ab"],
+                    weights.ip3_pol_ab_w,
+                    weights.ip3_pol_ab_b,
+                )
+                self.matmul(
+                    nnx_dict["promotion_dense_ab"],
+                    weights.ip4_pol_ab_w,
+                    None,
+                )
+            else:
+                self.matmul(
+                    nnx_dict["q_ab"], weights.ip2_pol_w, weights.ip2_pol_b
+                )
+                self.matmul(
+                    nnx_dict["k_ab"], weights.ip3_pol_w, weights.ip3_pol_b
+                )
+                self.matmul(
+                    nnx_dict["promotion_dense_ab"], weights.ip4_pol_w, None
+                )
+        if (
+            "gate_embed" in nnx_dict
+            and weights.HasField("ip_pol_gate_w")
+            and weights.HasField("ip_pol_gate_b")
+        ):
             self.matmul(
-                nnx_dict["q_ab"], weights.ip2_pol_w, weights.ip2_pol_b
+                nnx_dict["gate_embed"],
+                weights.ip_pol_gate_w,
+                weights.ip_pol_gate_b,
             )
             self.matmul(
-                nnx_dict["k_ab"], weights.ip3_pol_w, weights.ip3_pol_b
-            )
-            self.matmul(
-                nnx_dict["promotion_dense_ab"], weights.ip4_pol_w, None
+                nnx_dict["gate_dense1"],
+                weights.ip2_pol_gate_w,
+                weights.ip2_pol_gate_b,
             )
 
     def value_head(
@@ -198,10 +232,5 @@ class LeelaPytreeWeightsVisitor:
         param: Any,
         leela: net_pb2.Weights.Layer,
     ) -> None:
-        print(
-            param.shape,
-            len(leela.params) // 2,
-            math.prod(param.shape),
-        )
         assert len(leela.params) // 2 == math.prod(param.shape)
         assert len(leela.params) != 0

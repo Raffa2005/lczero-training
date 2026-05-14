@@ -59,6 +59,36 @@ class JaxToLeela(LeelaPytreeWeightsVisitor):
             weights.encoder.append(weights.EncoderLayer())
         return super().encoder_tower(nnx_dict=nnx_dict, weights=weights)
 
+    def policy_head(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights.PolicyHead
+    ) -> None:
+        if "tokens" in nnx_dict:
+            self.matmul(nnx_dict["tokens"], weights.ip_pol_w, weights.ip_pol_b)
+        self.matmul(nnx_dict["q"], weights.ip2_pol_w, weights.ip2_pol_b)
+        self.matmul(nnx_dict["k"], weights.ip3_pol_w, weights.ip3_pol_b)
+        self.matmul(nnx_dict["promotion_dense"], weights.ip4_pol_w, None)
+        if "q_ab" in nnx_dict:
+            self.matmul(
+                nnx_dict["q_ab"], weights.ip2_pol_ab_w, weights.ip2_pol_ab_b
+            )
+            self.matmul(
+                nnx_dict["k_ab"], weights.ip3_pol_ab_w, weights.ip3_pol_ab_b
+            )
+            self.matmul(
+                nnx_dict["promotion_dense_ab"], weights.ip4_pol_ab_w, None
+            )
+        if "gate_embed" in nnx_dict:
+            self.matmul(
+                nnx_dict["gate_embed"],
+                weights.ip_pol_gate_w,
+                weights.ip_pol_gate_b,
+            )
+            self.matmul(
+                nnx_dict["gate_dense1"],
+                weights.ip2_pol_gate_w,
+                weights.ip2_pol_gate_b,
+            )
+
 
 @dataclasses.dataclass
 class LeelaExportOptions:
@@ -110,7 +140,7 @@ def _make_format() -> net_pb2.Format:
     netfmt.value = netfmt.VALUE_WDL
     netfmt.moves_left = netfmt.MOVES_LEFT_V1
     netfmt.default_activation = netfmt.DEFAULT_ACTIVATION_MISH
-    netfmt.smolgen_activation = netfmt.ACTIVATION_SWISH
+    netfmt.smolgen_activation = netfmt.ACTIVATION_NONE
     netfmt.ffn_activation = netfmt.ACTIVATION_DEFAULT
     netfmt.input_embedding = netfmt.INPUT_EMBEDDING_PE_DENSE
 

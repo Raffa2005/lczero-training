@@ -19,6 +19,7 @@ from proto.training_config_pb2 import (
 )
 
 from .model import LczeroModel, ModelPrediction
+from .policy_head import PolicyHeadOutput
 
 
 def _compute_q_from_wdl(wdl_logits: jax.Array) -> jax.Array:
@@ -132,12 +133,8 @@ class LczeroLoss:
         self,
         model: LczeroModel,
         sample: TrainingSample,
-        step: Optional[jax.Array] = None,
     ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
-        # Run model forward pass. `step` is forwarded so policy heads with
-        # gradient gating (doublemove_grad_gate_step) can decide whether to
-        # block ability-head gradients into the encoder this step.
-        predictions = model(sample.inputs, step=step)
+        predictions = model(sample.inputs)
 
         unweighted_losses: Dict[str, jax.Array] = {}
         weighted_losses: List[jax.Array] = []
@@ -238,13 +235,9 @@ class PolicyLoss(LossBase):
     def _apply_temperature_and_normalize(
         self, policy_targets: jax.Array
     ) -> jax.Array:
-        if self._temperature == 1.0:
-            return policy_targets
+        if self._temperature != 1.0:
+            policy_targets = jnp.power(policy_targets, 1.0 / self._temperature)
 
-        # Apply temperature scaling.
-        policy_targets = jnp.power(policy_targets, 1.0 / self._temperature)
-
-        # Renormalize after temperature scaling.
         target_sum = jnp.sum(policy_targets, axis=-1, keepdims=True)
         safe_sum = jnp.where(
             target_sum > 0, target_sum, jnp.ones_like(target_sum)
@@ -278,25 +271,9 @@ class PolicyLoss(LossBase):
         # Compute weight.
         return jax.nn.sigmoid((z - self.opt_strength) * self.opt_alpha)
 
-    def __call__(
-        self,
-        predictions: ModelPrediction,
-        sample: TrainingSample,
+    def _compute_policy_loss(
+        self, policy_pred: jax.Array, policy_targets: jax.Array
     ) -> jax.Array:
-        policy_pred = predictions.policy[self.head_name]
-        # Extract probabilities from sample.
-        policy_targets = jnp.asarray(
-            sample.probabilities, dtype=policy_pred.dtype
-        )
-        if self.config.illegal_moves == PolicyLossConfig.MASK:
-            policy_pred = jnp.where(policy_targets >= 0, policy_pred, -jnp.inf)
-
-        # Zero out negative targets for illegal moves.
-        policy_targets = jax.nn.relu(policy_targets)
-
-        # Apply temperature scaling and renormalization if needed.
-        policy_targets = self._apply_temperature_and_normalize(policy_targets)
-
         cross_entropy = cast(
             jax.Array,
             optax.safe_softmax_cross_entropy(
@@ -304,15 +281,86 @@ class PolicyLoss(LossBase):
             ),
         )
         if self._loss_type == PolicyLossConfig.CROSS_ENTROPY:
-            loss = cross_entropy
-        elif self._loss_type == PolicyLossConfig.KL:
-            loss = cross_entropy + jnp.sum(
+            return cross_entropy
+        if self._loss_type == PolicyLossConfig.KL:
+            return cross_entropy + jnp.sum(
                 xlogy(policy_targets, policy_targets), axis=-1
             )
-        else:
-            raise AssertionError(
-                f"Unknown policy loss type: {self._loss_type}."
+        raise AssertionError(f"Unknown policy loss type: {self._loss_type}.")
+
+    def _compute_split_policy_loss(
+        self,
+        policy_pred: PolicyHeadOutput,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        policy_targets = jnp.asarray(
+            sample.probabilities, dtype=policy_pred.normal_logits.dtype
+        )
+        policy_targets = jax.nn.relu(policy_targets)
+
+        normal_targets_raw = policy_targets[:1858]
+        ability_targets_raw = policy_targets[1858:]
+
+        total_target = jnp.sum(policy_targets)
+        safe_total = jnp.maximum(total_target, 1e-8)
+        burn_frac = jnp.sum(ability_targets_raw) / safe_total
+        normal_frac = jnp.sum(normal_targets_raw) / safe_total
+
+        normal_targets = self._apply_temperature_and_normalize(
+            normal_targets_raw
+        )
+        ability_targets = self._apply_temperature_and_normalize(
+            ability_targets_raw
+        )
+
+        normal_logits = policy_pred.normal_logits
+        ability_logits = policy_pred.ability_logits
+        if self.config.illegal_moves == PolicyLossConfig.MASK:
+            normal_logits = jnp.where(
+                sample.probabilities[:1858] >= 0, normal_logits, -jnp.inf
             )
+            ability_logits = jnp.where(
+                sample.probabilities[1858:] >= 0, ability_logits, -jnp.inf
+            )
+
+        gate_target = jax.lax.stop_gradient(burn_frac)
+        gate_loss = optax.sigmoid_binary_cross_entropy(
+            policy_pred.gate_logit, gate_target
+        )
+
+        can_burn = sample.inputs[112, 0, 0]
+        gate_loss = gate_loss * can_burn
+
+        normal_loss = normal_frac * self._compute_policy_loss(
+            normal_logits, normal_targets
+        )
+        ability_loss = burn_frac * self._compute_policy_loss(
+            ability_logits, ability_targets
+        )
+        return gate_loss + normal_loss + ability_loss
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        policy_pred = predictions.policy[self.head_name]
+        if isinstance(policy_pred, PolicyHeadOutput):
+            loss = self._compute_split_policy_loss(policy_pred, sample)
+        else:
+            policy_targets = jnp.asarray(
+                sample.probabilities, dtype=policy_pred.dtype
+            )
+            if self.config.illegal_moves == PolicyLossConfig.MASK:
+                policy_pred = jnp.where(
+                    policy_targets >= 0, policy_pred, -jnp.inf
+                )
+
+            policy_targets = jax.nn.relu(policy_targets)
+            policy_targets = self._apply_temperature_and_normalize(
+                policy_targets
+            )
+            loss = self._compute_policy_loss(policy_pred, policy_targets)
 
         # Apply optimistic weighting if configured.
         if self.opt_value_head is not None:

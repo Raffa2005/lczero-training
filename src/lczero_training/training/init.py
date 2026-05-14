@@ -37,15 +37,7 @@ def _load_lc0_model_state(
     leela_config = leela_to_modelconfig(
         lc0_weights, hlo_pb2.XlaShapeProto.F32, compute_dtype
     )
-    # Strip training-time-only fields from the expected config before the
-    # structural shape compare. `doublemove_grad_gate_step` is the gating
-    # threshold for the doubled-policy stop-gradient; an oracle network has
-    # no concept of it, so leela_to_modelconfig will never produce it.
-    expected_config_for_cmp = type(expected_config)()
-    expected_config_for_cmp.CopyFrom(expected_config)
-    if expected_config_for_cmp.HasField("doublemove_grad_gate_step"):
-        expected_config_for_cmp.ClearField("doublemove_grad_gate_step")
-    if leela_config != expected_config_for_cmp:
+    if leela_config != expected_config:
         if ignore_config_mismatch:
             logger.warning(
                 "The provided lczero model configuration "

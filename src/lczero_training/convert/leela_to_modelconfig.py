@@ -107,6 +107,11 @@ def leela_to_modelconfig(
             if not model_config.HasField("shared_policy_embedding_size"):
                 policy_head.embedding_size = size(head.ip_pol_b)
             policy_head.d_model = size(head.ip2_pol_b)
+            policy_head.gate_hidden_dim = (
+                size(head.ip_pol_gate_b)
+                if head.HasField("ip_pol_gate_b")
+                else 256
+            )
 
     for head_name in ["winner", "q", "st"]:
         if weights.value_heads.HasField(head_name):

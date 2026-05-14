@@ -38,6 +38,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Export SWA model instead of regular model_state.",
     )
     parser.add_argument(
+        "--step",
+        type=int,
+        default=None,
+        help="Checkpoint step to export. Defaults to the latest step.",
+    )
+    parser.add_argument(
         "--min-version",
         type=str,
         default="0.31",
@@ -51,6 +57,7 @@ def jax2leela(
     output_path: str,
     export_swa: bool,
     min_version: str,
+    step: int | None = None,
 ) -> None:
     config = RootConfig()
     logging.info("Reading configuration from %s", config_filename)
@@ -72,8 +79,9 @@ def jax2leela(
         training_config=config.training,
     )
 
+    restore_step = step if step is not None else checkpoint_mgr.latest_step()
     restored_state = checkpoint_mgr.restore(
-        checkpoint_mgr.latest_step(), args=ocp.args.PyTreeRestore(empty_state)
+        restore_step, args=ocp.args.PyTreeRestore(empty_state)
     )
     assert isinstance(restored_state, TrainingState)
     logging.info(
@@ -124,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         output_path=args.output,
         export_swa=args.export_swa,
         min_version=args.min_version,
+        step=args.step,
     )
     return 0
 

@@ -36,6 +36,7 @@ from lczero_training.dataloader import (
 )
 from lczero_training.model.loss_function import LczeroLoss
 from lczero_training.model.model import LczeroModel, ModelPrediction
+from lczero_training.model.policy_head import PolicyHeadOutput
 from lczero_training.training.state import TrainingSample, TrainingState
 from proto import data_loader_config_pb2
 from proto.root_config_pb2 import RootConfig
@@ -465,7 +466,13 @@ class Evaluation:
                 pred = jax.nn.softmax(pred, axis=-1)
             outputs[f"value_pred/{name}"] = pred
         for name, pred in policy_preds.items():
-            outputs[f"policy_pred/{name}"] = pred
+            if isinstance(pred, PolicyHeadOutput):
+                outputs[f"policy_pred/{name}"] = pred.composed
+                outputs[f"policy_pred/{name}_gate"] = pred.gate_logit
+                outputs[f"policy_pred/{name}_normal"] = pred.normal_logits
+                outputs[f"policy_pred/{name}_ability"] = pred.ability_logits
+            else:
+                outputs[f"policy_pred/{name}"] = pred
         for name, pred in movesleft_preds.items():
             outputs[f"movesleft_pred/{name}"] = pred
 
@@ -473,7 +480,11 @@ class Evaluation:
             # Compare only legacy heads
             jax_outputs_for_onnx = {
                 "wdl": value_preds["winner"][0],
-                "policy": policy_preds["vanilla"],
+                "policy": (
+                    policy_preds["vanilla"].composed
+                    if isinstance(policy_preds["vanilla"], PolicyHeadOutput)
+                    else policy_preds["vanilla"]
+                ),
                 "movesleft": movesleft_preds["main"],
             }
             onnx_inputs_np = np.asarray(batch["inputs"]).copy()

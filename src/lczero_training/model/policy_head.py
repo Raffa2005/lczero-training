@@ -1,13 +1,24 @@
 import math
+from dataclasses import dataclass
 from typing import Optional
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
+from flax.linen import initializers as flax_initializers
 
 from proto import model_config_pb2
 
 from .utils import get_activation  # , get_policy_map
+
+
+@jax.tree_util.register_dataclass
+@dataclass
+class PolicyHeadOutput:
+    composed: jax.Array
+    gate_logit: jax.Array
+    normal_logits: jax.Array
+    ability_logits: jax.Array
 
 
 class PolicyHead(nnx.Module):
@@ -75,12 +86,21 @@ class PolicyHead(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(
-        self,
-        x: jax.Array,
-        step: Optional[jax.Array] = None,
-        ability_grad_gate_step: int = 0,
-    ) -> jax.Array:
+        gate_hidden_dim = config.gate_hidden_dim or 256
+        self.gate_embed = nnx.Linear(
+            in_features=embedding_size,
+            out_features=gate_hidden_dim,
+            rngs=rngs,
+        )
+        self.gate_dense1 = nnx.Linear(
+            in_features=gate_hidden_dim,
+            out_features=1,
+            kernel_init=flax_initializers.normal(stddev=0.01),
+            bias_init=flax_initializers.constant(-4.5),
+            rngs=rngs,
+        )
+
+    def __call__(self, x: jax.Array) -> PolicyHeadOutput:
         x = self.tokens(x)
         x = get_activation(self.activation)(x)
 
@@ -114,22 +134,12 @@ class PolicyHead(nnx.Module):
         logits = jnp.concatenate(
             [policy_attn_logits.flatten(), promotion_logits.flatten()], axis=-1
         )
-        normal_policy = logits[_policy_map]
+        normal_logits = logits[_policy_map]
 
         # --- Ability-activation policy (indices 1858-3715) ---
-        # Gate gradient flow from the ability projections back into the shared
-        # encoder. While `step < ability_grad_gate_step`, the ability head sees
-        # stop_gradient(x): q_ab/k_ab/promotion_dense_ab still update from
-        # policy CE, but their gradient does NOT propagate into tokens / encoder
-        # / embedding. This protects pretrained upstream weights from being
-        # dragged off-distribution by random ability priors during the warm-up
-        # window. After the gate opens, full backprop resumes.
-        if ability_grad_gate_step > 0 and step is not None:
-            gate_open = (step >= ability_grad_gate_step).astype(x.dtype)
-            x_ab = gate_open * x + (1.0 - gate_open) * jax.lax.stop_gradient(x)
-        else:
-            x_ab = x
-
+        # Keep early ability-policy imitation from rewriting the shared BT3
+        # representation. The ability head itself still trains normally.
+        x_ab = jax.lax.stop_gradient(x)
         q_ab = self.q_ab(x_ab)
         k_ab = self.k_ab(x_ab)
         qk_ab = jnp.einsum("qd,kd->qk", q_ab, k_ab)
@@ -163,9 +173,31 @@ class PolicyHead(nnx.Module):
             [policy_attn_logits_ab.flatten(), promotion_logits_ab.flatten()],
             axis=-1,
         )
-        ability_policy = logits_ab[_policy_map]
+        ability_logits = logits_ab[_policy_map]
 
-        return jnp.concatenate([normal_policy, ability_policy], axis=-1)
+        # The gate is a selector on top of the representation; do not let its
+        # cold-start burn targets steer the encoder during the fragile phase.
+        gate_input = jax.lax.stop_gradient(x).mean(axis=0)
+        gate_hidden = jax.nn.gelu(self.gate_embed(gate_input))
+        gate_logit = self.gate_dense1(gate_hidden).squeeze(axis=-1)
+
+        p_burn = jax.nn.sigmoid(gate_logit)
+        normal_probs = jax.nn.softmax(normal_logits, axis=-1)
+        ability_probs = jax.nn.softmax(ability_logits, axis=-1)
+        composed = jnp.concatenate(
+            [
+                (1.0 - p_burn) * normal_probs,
+                p_burn * ability_probs,
+            ],
+            axis=-1,
+        )
+
+        return PolicyHeadOutput(
+            composed=composed,
+            gate_logit=gate_logit,
+            normal_logits=normal_logits,
+            ability_logits=ability_logits,
+        )
 
 
 # fmt: off

@@ -131,14 +131,14 @@ class LeelaToJax(LeelaPytreeWeightsVisitor):
         kernel_param: Any,
         oracle_layer: net_pb2.Weights.Layer,
     ) -> None:
-        """Load oracle ip_emb_w with 2 zero-init rows for ability planes.
+        """Load oracle ip_emb_w with 2 zero rows for ability planes.
 
         Oracle kernel shape: (112 + dense_size, embedding_size).
         Trainee kernel shape: (114 + dense_size, embedding_size).
 
         Layout after splice (rows = input features):
             rows 0..111      ← oracle rows 0..111   (standard planes)
-            rows 112..113    ← zeros                (ability planes — new)
+            rows 112..113    ← zero init            (ability planes — new)
             rows 114..114+ds ← oracle rows 112..    (dense positional rows)
 
         Bias is unaffected (its shape is (embedding_size,)).
@@ -173,11 +173,11 @@ class LeelaToJax(LeelaPytreeWeightsVisitor):
         )
         oracle_kernel = decoded.reshape(embedding_size, oracle_in).transpose()
 
-        zeros = jnp.zeros((2, embedding_size), dtype=oracle_kernel.dtype)
+        ability_rows = jnp.zeros((2, embedding_size), dtype=oracle_kernel.dtype)
         new_kernel = jnp.concatenate(
             [
                 oracle_kernel[:112],   # standard planes 0..111
-                zeros,                 # ability planes 112, 113 (zero-init)
+                ability_rows,          # ability planes 112, 113
                 oracle_kernel[112:],   # dense positional rows 114..
             ],
             axis=0,
@@ -248,12 +248,12 @@ def leela_to_jax_files(
         import_options.compute_dtype,
     )
 
-    if print_modelconfig:
-        print(config)
-
     if output_modelconfig:
         with open(output_modelconfig, "w") as f:
             f.write(str(config))
+
+    if print_modelconfig:
+        print(config)
 
     if output_serialized_jax is None and output_leela_verification is None:
         return
