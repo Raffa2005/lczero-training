@@ -135,13 +135,10 @@ class LeelaPytreeWeightsVisitor:
         self.matmul(nnx_dict["q"], weights.ip2_pol_w, weights.ip2_pol_b)
         self.matmul(nnx_dict["k"], weights.ip3_pol_w, weights.ip3_pol_b)
         self.matmul(nnx_dict["promotion_dense"], weights.ip4_pol_w, None)
-        # Double-move variant: initialise the ability-activation policy head
-        # (q_ab / k_ab / promotion_dense_ab) from the same BT3 weights as the
-        # normal policy head.  This gives the ability head sensible chess
-        # priors instead of random init, preventing random ability-policy
-        # priors from corrupting MCTS visit distributions and destroying the
-        # pretrained encoder through backprop.  The ability head can then
-        # learn the *difference* between normal and double-move play.
+        # Double-move variant: load an existing ability head when present.
+        # Fresh warm starts keep the model's zero-initialized ability head,
+        # yielding a uniform legal-move prior instead of copying ordinary
+        # chess priors into a different action space.
         if "q_ab" in nnx_dict:
             if weights.HasField("ip2_pol_ab_w") and weights.HasField(
                 "ip2_pol_ab_b"
@@ -160,16 +157,6 @@ class LeelaPytreeWeightsVisitor:
                     nnx_dict["promotion_dense_ab"],
                     weights.ip4_pol_ab_w,
                     None,
-                )
-            else:
-                self.matmul(
-                    nnx_dict["q_ab"], weights.ip2_pol_w, weights.ip2_pol_b
-                )
-                self.matmul(
-                    nnx_dict["k_ab"], weights.ip3_pol_w, weights.ip3_pol_b
-                )
-                self.matmul(
-                    nnx_dict["promotion_dense_ab"], weights.ip4_pol_w, None
                 )
         if (
             "gate_embed" in nnx_dict

@@ -67,15 +67,24 @@ class PolicyHead(nnx.Module):
         )
 
         # Second set of projections for ability-activation policy.
+        # Use a small random init: gradients can flow (zero-init traps qk_ab at
+        # a saddle point) while the resulting ability priors remain close to
+        # uniform at step 0.
+        ab_kernel = flax_initializers.normal(stddev=0.02)
+        ab_bias = flax_initializers.constant(0.0)
         self.q_ab = nnx.Linear(
             in_features=embedding_size,
             out_features=config.d_model,
+            kernel_init=ab_kernel,
+            bias_init=ab_bias,
             rngs=rngs,
         )
 
         self.k_ab = nnx.Linear(
             in_features=embedding_size,
             out_features=config.d_model,
+            kernel_init=ab_kernel,
+            bias_init=ab_bias,
             rngs=rngs,
         )
 
@@ -83,6 +92,7 @@ class PolicyHead(nnx.Module):
             in_features=config.d_model,
             out_features=4,
             use_bias=False,
+            kernel_init=ab_kernel,
             rngs=rngs,
         )
 
@@ -95,8 +105,8 @@ class PolicyHead(nnx.Module):
         self.gate_dense1 = nnx.Linear(
             in_features=gate_hidden_dim,
             out_features=1,
-            kernel_init=flax_initializers.normal(stddev=0.01),
-            bias_init=flax_initializers.constant(-4.5),
+            kernel_init=flax_initializers.constant(0.0),
+            bias_init=flax_initializers.constant(0.0),
             rngs=rngs,
         )
 
@@ -137,9 +147,9 @@ class PolicyHead(nnx.Module):
         normal_logits = logits[_policy_map]
 
         # --- Ability-activation policy (indices 1858-3715) ---
-        # Keep early ability-policy imitation from rewriting the shared BT3
-        # representation. The ability head itself still trains normally.
-        x_ab = jax.lax.stop_gradient(x)
+        # v28 opens the top representation after the shielded warmup, so the
+        # ability-policy loss can teach the unfrozen encoder layers directly.
+        x_ab = x
         q_ab = self.q_ab(x_ab)
         k_ab = self.k_ab(x_ab)
         qk_ab = jnp.einsum("qd,kd->qk", q_ab, k_ab)
@@ -175,9 +185,9 @@ class PolicyHead(nnx.Module):
         )
         ability_logits = logits_ab[_policy_map]
 
-        # The gate is a selector on top of the representation; do not let its
-        # cold-start burn targets steer the encoder during the fragile phase.
-        gate_input = jax.lax.stop_gradient(x).mean(axis=0)
+        # Let gate targets update the unfrozen top representation after the
+        # shielded warmup has already learned a usable burn selector.
+        gate_input = x.mean(axis=0)
         gate_hidden = jax.nn.gelu(self.gate_embed(gate_input))
         gate_logit = self.gate_dense1(gate_hidden).squeeze(axis=-1)
 

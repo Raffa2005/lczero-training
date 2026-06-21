@@ -156,6 +156,15 @@ message PolicyLossConfig {
   // Values <= 0 disable the adjustment and keep raw targets.
   float temperature = 6;
   OptimisticPolicyConfig optimistic = 7;
+  // Optional focus weighting for split double-move policy losses.
+  //
+  // When burn_focus_alpha > 0, the split-policy implementation multiplies
+  // only the burn gate BCE and ability-branch CE by:
+  //   min(burn_focus_max_weight, 1 + burn_focus_alpha * burn_frac^2)
+  // The normal policy branch is intentionally left unweighted.
+  float burn_focus_alpha = 8;
+  // Values <= 0 disable the cap.
+  float burn_focus_max_weight = 9;
 }
 
 message ValueLossConfig {
