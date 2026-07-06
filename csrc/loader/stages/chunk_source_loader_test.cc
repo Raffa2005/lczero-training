@@ -3,6 +3,7 @@
 #include <absl/cleanup/cleanup.h>
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -220,16 +221,15 @@ TEST(ChunkSourceLoaderTest, RawFileChunkSourceUsesFrameCountForWindowUnits) {
   EXPECT_EQ(source.GetWindowUnits(), 3u);
 }
 
-TEST(ChunkSourceLoaderTest, RawGzipWindowAccountingUsesFooterISize) {
+TEST(ChunkSourceLoaderTest, RawGzipWindowAccountingUsesCompressedSizeEstimate) {
   const auto path = std::filesystem::temp_directory_path() /
                     "rawfile_chunk_source_window_units.gz";
   std::error_code error;
   std::filesystem::remove(path, error);
   absl::Cleanup cleanup = [&] { std::filesystem::remove(path, error); };
 
-  // Real gzip files would have a header + DEFLATE stream, but for window
-  // accounting only the trailing 4-byte ISIZE matters. Synthesize a file
-  // with a dummy body and a hand-written footer claiming kFrames frames.
+  // Window accounting intentionally does not read the gzip footer; it uses
+  // compressed file size as a cheap estimate instead.
   constexpr size_t kFrames = 3;
   const uint32_t raw_size = kFrames * sizeof(V6TrainingData);
   std::ofstream file(path, std::ios::binary);
@@ -248,7 +248,7 @@ TEST(ChunkSourceLoaderTest, RawGzipWindowAccountingUsesFooterISize) {
   RawFileChunkSource raw_source(path, ChunkSourceLoaderConfig::V6TrainingData);
   ChunkSource& source = raw_source;
   EXPECT_EQ(source.GetChunkCount(), 1u);
-  EXPECT_EQ(source.GetWindowUnits(), kFrames);
+  EXPECT_EQ(source.GetWindowUnits(), 1u);
 }
 
 }  // namespace training

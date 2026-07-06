@@ -349,6 +349,14 @@ dump_chunk = executable(
   link_with : loader_lib,
 )
 
+material_value_windows = executable(
+  'material_value_windows',
+  'csrc/tools/material_value_windows_main.cc',
+  include_directories : includes,
+  dependencies : cli_deps + [zlib_dep],
+  link_with : loader_lib,
+)
+
 filter_chunks = executable(
   'filter_chunks',
   'csrc/tools/filter_chunks_main.cc',

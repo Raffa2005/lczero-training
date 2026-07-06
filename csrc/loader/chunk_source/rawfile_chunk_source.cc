@@ -3,10 +3,7 @@
 #include <absl/log/log.h>
 
 #include <algorithm>
-#include <cstdint>
 #include <cstring>
-#include <fstream>
-#include <stdexcept>
 
 #include "trainingdata/trainingdata_v6.h"
 #include "utils/files.h"
@@ -17,67 +14,53 @@ namespace training {
 
 namespace {
 
+constexpr size_t kEstimatedGzipBytesPerWindowUnit = 240;
+
 size_t GetFrameSize(ChunkSourceLoaderConfig::FrameFormat frame_format) {
   return frame_format == ChunkSourceLoaderConfig::V7TrainingData
              ? sizeof(V7TrainingData)
              : sizeof(V6TrainingData);
 }
 
-// Reads the uncompressed size from a single-member gzip file's ISIZE footer
-// (RFC 1952). Only valid for files <4GB and single-member archives, both of
-// which hold for self-play game files. Returns nullopt on any I/O issue.
-std::optional<size_t> GetGzipUncompressedSize(
-    const std::filesystem::path& filename) {
-  std::ifstream file(filename, std::ios::binary);
-  if (!file) {
-    LOG(WARNING) << "Could not open gzip file " << filename
-                 << " to read its uncompressed size.";
-    return std::nullopt;
+size_t EstimateGzipWindowUnits(const std::filesystem::path& filename) {
+  std::error_code error;
+  const auto size = std::filesystem::file_size(filename, error);
+  if (error) {
+    LOG(WARNING) << "Could not stat gzip file " << filename
+                 << " to estimate its window units: " << error.message();
+    return 1;
   }
-  file.seekg(0, std::ios::end);
-  const auto end = file.tellg();
-  if (end < static_cast<std::streamoff>(4)) {
-    LOG(WARNING) << "Gzip file " << filename
-                 << " is too small to contain an ISIZE footer.";
-    return std::nullopt;
-  }
-  file.seekg(-4, std::ios::end);
-  uint8_t footer[4];
-  if (!file.read(reinterpret_cast<char*>(footer), sizeof(footer))) {
-    LOG(WARNING) << "Failed reading gzip ISIZE footer from " << filename;
-    return std::nullopt;
-  }
-  return static_cast<size_t>(footer[0]) |
-         (static_cast<size_t>(footer[1]) << 8) |
-         (static_cast<size_t>(footer[2]) << 16) |
-         (static_cast<size_t>(footer[3]) << 24);
+  const size_t estimated_units =
+      (static_cast<size_t>(size) + kEstimatedGzipBytesPerWindowUnit - 1) /
+      kEstimatedGzipBytesPerWindowUnit;
+  return std::max<size_t>(1, estimated_units);
 }
 
 // Returns the number of training frames the file contains, computed from the
-// file size without decompressing. Falls back to 1 (the historical bucket
+// file size without decompressing. For gzip files, use compressed size as a
+// calibrated proxy; reading the gzip footer for every candidate is too costly
+// on cold Lustre replay directories. Falls back to 1 (the historical bucket
 // count) on any error.
 size_t ComputeWindowUnits(const std::filesystem::path& filename,
                           ChunkSourceLoaderConfig::FrameFormat frame_format) {
   const size_t frame_size = GetFrameSize(frame_format);
-  std::optional<size_t> raw_size;
   if (filename.extension() == ".gz") {
-    raw_size = GetGzipUncompressedSize(filename);
-  } else {
-    std::error_code error;
-    const auto size = std::filesystem::file_size(filename, error);
-    if (!error) raw_size = size;
+    return EstimateGzipWindowUnits(filename);
   }
-  if (!raw_size.has_value()) {
+
+  std::error_code error;
+  const auto raw_size = std::filesystem::file_size(filename, error);
+  if (error) {
     LOG(WARNING) << "Falling back to one window unit for " << filename;
     return 1;
   }
-  if (*raw_size < frame_size) return 1;
-  if (*raw_size % frame_size != 0) {
-    LOG(WARNING) << "File " << filename << " size " << *raw_size
+  if (raw_size < frame_size) return 1;
+  if (raw_size % frame_size != 0) {
+    LOG(WARNING) << "File " << filename << " size " << raw_size
                  << " is not a multiple of input frame size " << frame_size
                  << "; rounding down for window accounting.";
   }
-  return std::max<size_t>(1, *raw_size / frame_size);
+  return std::max<size_t>(1, raw_size / frame_size);
 }
 
 }  // namespace
