@@ -165,6 +165,10 @@ message PolicyLossConfig {
   float burn_focus_alpha = 8;
   // Values <= 0 disable the cap.
   float burn_focus_max_weight = 9;
+  // Optional positive-only gate loss for positions where search proved a
+  // double-move best move. The target is p_burn=1 and the normal policy target
+  // is left unchanged. Values <= 0 disable it.
+  float proof_focus_weight = 10;
 }
 
 message ValueLossConfig {

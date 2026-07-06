@@ -89,17 +89,20 @@ TensorTuple TensorGenerator::ConvertFramesToTensors(
   constexpr size_t kNumPolicyMoves = 3716;
   constexpr size_t kNumValueTypes = 6;
   constexpr size_t kValuesPerType = 3;
+  constexpr size_t kAuxiliaryTargets = 1;
+  constexpr uint8_t kBestIsProvenMask = 1u << 3;
+  constexpr uint16_t kFirstAbilityMove = 1858;
 
   TensorTuple result;
-  result.reserve(3);
+  result.reserve(4);
 
-  // Index 0: Input planes (batch_size, 112, 8, 8)
+  // Index 0: Input planes (batch_size, 114, 8, 8)
   auto planes_tensor = std::make_unique<TypedTensor<float>>(
       std::initializer_list<size_t>{batch_size, kNumPlanes, 8, 8});
   ProcessPlanes(frames, *planes_tensor);
   result.push_back(std::move(planes_tensor));
 
-  // Index 1: Probabilities (batch_size, 1858)
+  // Index 1: Probabilities (batch_size, 3716)
   auto probs_tensor = std::make_unique<TypedTensor<float>>(
       std::initializer_list<size_t>{batch_size, kNumPolicyMoves});
   for (size_t i = 0; i < batch_size; ++i) {
@@ -155,6 +158,24 @@ TensorTuple TensorGenerator::ConvertFramesToTensors(
     st_slice[2] = std::numeric_limits<float>::quiet_NaN();
   }
   result.push_back(std::move(values_tensor));
+
+  // Index 3: Auxiliary targets (batch_size, 1).
+  // [0]: proven_best_dm, set when search proved a double-move best move.
+  auto aux_tensor =
+      std::make_unique<TypedTensor<float>>(std::initializer_list<size_t>{
+          batch_size, kAuxiliaryTargets});
+  for (size_t i = 0; i < batch_size; ++i) {
+    const auto& frame = frames[i];
+    const bool best_is_proven =
+        (frame.invariance_info & kBestIsProvenMask) != 0;
+    const bool best_is_doublemove =
+        frame.best_idx >= kFirstAbilityMove && frame.best_idx < kNumPolicyMoves;
+    const bool can_burn = frame.our_doublemove_available != 0;
+    auto aux_slice = aux_tensor->slice({static_cast<ssize_t>(i)});
+    aux_slice[0] =
+        (best_is_proven && best_is_doublemove && can_burn) ? 1.0f : 0.0f;
+  }
+  result.push_back(std::move(aux_tensor));
 
   return result;
 }

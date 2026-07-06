@@ -87,6 +87,7 @@ class Training:
                 inputs=dp_sharding,
                 probabilities=dp_sharding,
                 values=dp_sharding,
+                auxiliary_targets=dp_sharding,
             )
             in_shardings = (replicated, batch_sharding)
             out_shardings = replicated

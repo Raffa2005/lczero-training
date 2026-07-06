@@ -221,6 +221,7 @@ class PolicyLoss(LossBase):
         self._temperature = temperature
         self._burn_focus_alpha = config.burn_focus_alpha
         self._burn_focus_max_weight = config.burn_focus_max_weight
+        self._proof_focus_weight = config.proof_focus_weight
 
         # Store optimistic config if present.
         if config.HasField("optimistic"):
@@ -340,10 +341,8 @@ class PolicyLoss(LossBase):
             ability_logits, ability_targets
         )
         if self._burn_focus_alpha > 0:
-            focus_weight = (
-                1.0
-                + self._burn_focus_alpha
-                * jnp.square(jax.lax.stop_gradient(burn_frac))
+            focus_weight = 1.0 + self._burn_focus_alpha * jnp.square(
+                jax.lax.stop_gradient(burn_frac)
             )
             if self._burn_focus_max_weight > 0:
                 focus_weight = jnp.minimum(
@@ -351,6 +350,18 @@ class PolicyLoss(LossBase):
                 )
             gate_loss = gate_loss * focus_weight
             ability_loss = ability_loss * focus_weight
+        if self._proof_focus_weight > 0:
+            proven_best_dm = jax.lax.stop_gradient(sample.auxiliary_targets[0])
+            proof_gate_loss = optax.sigmoid_binary_cross_entropy(
+                policy_pred.gate_logit,
+                jnp.ones_like(policy_pred.gate_logit),
+            )
+            gate_loss = gate_loss + (
+                self._proof_focus_weight
+                * proven_best_dm
+                * can_burn
+                * proof_gate_loss
+            )
         return gate_loss + normal_loss + ability_loss
 
     def __call__(

@@ -92,8 +92,8 @@ class TensorGeneratorTest : public ::testing::Test {
                          const std::vector<FrameType>& frames) {
     const size_t batch_size = frames.size();
 
-    // Verify tuple has 3 elements
-    ASSERT_EQ(tensors.size(), 3);
+    // Verify tuple has 4 elements.
+    ASSERT_EQ(tensors.size(), 4);
 
     // Verify input tensor: (batch_size, 112, 8, 8)
     const auto* planes_tensor =
@@ -121,6 +121,14 @@ class TensorGeneratorTest : public ::testing::Test {
     EXPECT_EQ(values_tensor->shape()[0], batch_size);
     EXPECT_EQ(values_tensor->shape()[1], 6);
     EXPECT_EQ(values_tensor->shape()[2], 3);
+
+    // Verify auxiliary targets tensor: (batch_size, 1)
+    const auto* aux_tensor =
+        dynamic_cast<const TypedTensor<float>*>(tensors[3].get());
+    ASSERT_NE(aux_tensor, nullptr);
+    EXPECT_EQ(aux_tensor->shape().size(), 2);
+    EXPECT_EQ(aux_tensor->shape()[0], batch_size);
+    EXPECT_EQ(aux_tensor->shape()[1], 1);
   }
 
   void VerifyTensorData(const TensorTuple& tensors,
@@ -132,6 +140,8 @@ class TensorGeneratorTest : public ::testing::Test {
         dynamic_cast<const TypedTensor<float>*>(tensors[1].get());
     const auto* values_tensor =
         dynamic_cast<const TypedTensor<float>*>(tensors[2].get());
+    const auto* aux_tensor =
+        dynamic_cast<const TypedTensor<float>*>(tensors[3].get());
 
     for (size_t i = 0; i < batch_size; ++i) {
       const auto& frame = frames[i];
@@ -153,6 +163,16 @@ class TensorGeneratorTest : public ::testing::Test {
       EXPECT_FLOAT_EQ(values_slice[1 * 3 + 0], 0.3f);   // best_q
       EXPECT_FLOAT_EQ(values_slice[1 * 3 + 1], 0.1f);   // best_d
       EXPECT_FLOAT_EQ(values_slice[1 * 3 + 2], 42.5f);  // best_m
+
+      // Verify proof-focus auxiliary target.
+      auto aux_slice = aux_tensor->slice({static_cast<ssize_t>(i)});
+      const bool proven_best = (frame.invariance_info & (1u << 3)) != 0;
+      const bool best_is_doublemove =
+          frame.best_idx >= 1858 && frame.best_idx < 3716;
+      const bool can_burn = frame.our_doublemove_available != 0;
+      const float expected_proven_best_dm =
+          (proven_best && best_is_doublemove && can_burn) ? 1.0f : 0.0f;
+      EXPECT_FLOAT_EQ(aux_slice[0], expected_proven_best_dm);
 
       // Verify planes data - check first few planes and meta planes.
       auto planes_slice = planes_tensor->slice({static_cast<ssize_t>(i)});
@@ -367,6 +387,67 @@ TEST_F(TensorGeneratorTest, VerifiesQDConversion) {
   // Verify best values: q=-0.2, d=0.1 (raw values, no WDL conversion)
   EXPECT_FLOAT_EQ(values_slice[1 * 3 + 0], -0.2f);  // best_q
   EXPECT_FLOAT_EQ(values_slice[1 * 3 + 1], 0.1f);   // best_d
+}
+
+TEST_F(TensorGeneratorTest, GeneratesProofFocusAuxiliaryTargets) {
+  config_.set_batch_size(5);
+  TensorGenerator generator(config_);
+  generator.SetInputs({input_queue_.get()});
+  generator.Start();
+
+  auto producer = input_queue_->CreateProducer();
+
+  std::vector<FrameType> frames;
+
+  // Proven double-move and burn is available: proof-focus target is active.
+  auto proven_dm = CreateTestFrame();
+  proven_dm.invariance_info |= 1u << 3;
+  proven_dm.best_idx = 1858;
+  proven_dm.our_doublemove_available = 1;
+  frames.push_back(proven_dm);
+
+  // Proven, but best move is an ordinary move.
+  auto proven_normal = CreateTestFrame();
+  proven_normal.invariance_info |= 1u << 3;
+  proven_normal.best_idx = 42;
+  proven_normal.our_doublemove_available = 1;
+  frames.push_back(proven_normal);
+
+  // Best move is a double-move, but it was not proven.
+  auto unproven_dm = CreateTestFrame();
+  unproven_dm.best_idx = 1858;
+  unproven_dm.our_doublemove_available = 1;
+  frames.push_back(unproven_dm);
+
+  // Proven double-move, but burn is unavailable in this position.
+  auto cannot_burn = CreateTestFrame();
+  cannot_burn.invariance_info |= 1u << 3;
+  cannot_burn.best_idx = 1858;
+  cannot_burn.our_doublemove_available = 0;
+  frames.push_back(cannot_burn);
+
+  // Invalid sentinel/out-of-range best index should not activate.
+  auto invalid_best = CreateTestFrame();
+  invalid_best.invariance_info |= 1u << 3;
+  invalid_best.best_idx = 3716;
+  invalid_best.our_doublemove_available = 1;
+  frames.push_back(invalid_best);
+
+  for (const auto& frame : frames) {
+    producer.Put(frame);
+  }
+  producer.Close();
+
+  auto tensors = generator.output_queue()->Get();
+  const auto* aux_tensor =
+      dynamic_cast<const TypedTensor<float>*>(tensors[3].get());
+  ASSERT_NE(aux_tensor, nullptr);
+
+  const float expected[] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  for (size_t i = 0; i < frames.size(); ++i) {
+    auto aux_slice = aux_tensor->slice({static_cast<ssize_t>(i)});
+    EXPECT_FLOAT_EQ(aux_slice[0], expected[i]) << "sample " << i;
+  }
 }
 
 }  // namespace training

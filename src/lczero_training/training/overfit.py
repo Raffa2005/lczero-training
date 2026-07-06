@@ -35,12 +35,7 @@ def _stop_loader(loader: DataLoader) -> None:
 
 
 def _prepare_batch(batch_tuple: tuple) -> TrainingBatch:
-    # DataLoader now returns tuple: (inputs, probabilities, values)
-    return TrainingBatch(
-        inputs=jnp.asarray(batch_tuple[0]),
-        probabilities=jnp.asarray(batch_tuple[1]),
-        values=jnp.asarray(batch_tuple[2]),
-    )
+    return TrainingBatch.from_tuple(batch_tuple)
 
 
 def _make_eval_step(graphdef: nnx.GraphDef, loss_fn: LczeroLoss) -> Any:

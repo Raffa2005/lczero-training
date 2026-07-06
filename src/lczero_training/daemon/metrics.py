@@ -15,7 +15,11 @@ from lczero_training._lczero_training import DataLoader
 from lczero_training.daemon.metrics_base import _Metric
 from lczero_training.daemon.rms_metrics import _RmsMetric
 from lczero_training.model.loss_function import LczeroLoss
-from lczero_training.training.state import JitTrainingState, TrainingSample
+from lczero_training.training.state import (
+    JitTrainingState,
+    TrainingBatch,
+    TrainingSample,
+)
 from lczero_training.training.tensorboard import TensorboardLogger
 from lczero_training.training.training import StepHookData
 from proto.metrics_config_pb2 import MetricConfig, MetricsConfig
@@ -42,7 +46,7 @@ def load_batch_from_npz(npz_filename: str) -> BatchTuple:
         npz_filename: Path to the NPZ file.
 
     Returns:
-        BatchTuple (tuple of inputs, probabilities, values arrays).
+        BatchTuple (inputs, probabilities, values, optional auxiliary targets).
 
     Raises:
         ValueError: If the NPZ file doesn't contain exactly one batch.
@@ -54,6 +58,16 @@ def load_batch_from_npz(npz_filename: str) -> BatchTuple:
                 f"Expected 1 batch in npz '{npz_filename}', got {batches.size}"
             )
         return batches[0]
+
+
+def _batch_to_training_sample(batch: BatchTuple) -> TrainingSample:
+    training_batch = TrainingBatch.from_tuple(batch)
+    return TrainingSample(
+        inputs=jnp.asarray(training_batch.inputs),
+        probabilities=jnp.asarray(training_batch.probabilities),
+        values=jnp.asarray(training_batch.values),
+        auxiliary_targets=jnp.asarray(training_batch.auxiliary_targets),
+    )
 
 
 class _TrainingBatchMetric(_Metric):
@@ -107,11 +121,7 @@ class _EvaluatingMetric(_Metric, ABC):
         )
         if model_state is None:
             raise RuntimeError("SWA state not available")
-        batch_sample = TrainingSample(
-            inputs=jnp.asarray(batch[0]),
-            probabilities=jnp.asarray(batch[1]),
-            values=jnp.asarray(batch[2]),
-        )
+        batch_sample = _batch_to_training_sample(batch)
         return _make_eval_jit(graphdef, self.loss_fn)(model_state, batch_sample)
 
 
@@ -151,7 +161,7 @@ def evaluate_batch(
     """Evaluate loss function on a batch of data.
 
     Args:
-        batch: BatchTuple (inputs, probabilities, values).
+        batch: BatchTuple (inputs, probabilities, values, optional auxiliary targets).
         jit_state: JIT training state containing model and optimizer state.
         graphdef: Graph definition of the model.
         loss_fn: Loss function to evaluate.
@@ -165,11 +175,7 @@ def evaluate_batch(
     )
     if model_state is None:
         raise RuntimeError("SWA state not available")
-    batch_sample = TrainingSample(
-        inputs=jnp.asarray(batch[0]),
-        probabilities=jnp.asarray(batch[1]),
-        values=jnp.asarray(batch[2]),
-    )
+    batch_sample = _batch_to_training_sample(batch)
     return _make_eval_jit(graphdef, loss_fn)(model_state, batch_sample)
 
 

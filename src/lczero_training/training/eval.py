@@ -37,7 +37,11 @@ from lczero_training.dataloader import (
 from lczero_training.model.loss_function import LczeroLoss
 from lczero_training.model.model import LczeroModel, ModelPrediction
 from lczero_training.model.policy_head import PolicyHeadOutput
-from lczero_training.training.state import TrainingSample, TrainingState
+from lczero_training.training.state import (
+    TrainingBatch,
+    TrainingSample,
+    TrainingState,
+)
 from proto import data_loader_config_pb2
 from proto.root_config_pb2 import RootConfig
 
@@ -445,11 +449,14 @@ class Evaluation:
         batch_tuple = next(datagen)
         logger.info("Fetched batch from dataloader")
 
-        # DataLoader now returns tuple: (inputs, probabilities, values)
+        batch_tensors = TrainingBatch.from_tuple(batch_tuple)
         batch = {
-            "inputs": cast(jax.Array, jnp.asarray(batch_tuple[0])),
-            "probabilities": cast(jax.Array, jnp.asarray(batch_tuple[1])),
-            "values": cast(jax.Array, jnp.asarray(batch_tuple[2])),
+            "inputs": cast(jax.Array, batch_tensors.inputs),
+            "probabilities": cast(jax.Array, batch_tensors.probabilities),
+            "values": cast(jax.Array, batch_tensors.values),
+            "auxiliary_targets": cast(
+                jax.Array, batch_tensors.auxiliary_targets
+            ),
         }
         dumper.dump_tensors(batch, "INPUT")
 
@@ -501,6 +508,7 @@ class Evaluation:
             inputs=batch["inputs"],
             probabilities=batch["probabilities"],
             values=batch["values"],
+            auxiliary_targets=batch["auxiliary_targets"],
         )
         per_sample_loss, unweighted_losses = loss_vfn(model, batch_sample)
         losses = {

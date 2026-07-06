@@ -39,11 +39,14 @@ class TrainingSample:
             - Index 3: orig [orig_q, orig_d, orig_m] (may contain NaN)
             - Index 4: root [root_q, root_d, root_m]
             - Index 5: st [q_st, d_st, NaN]
+        auxiliary_targets: Extra scalar training targets [1] where:
+            - Index 0: proven_best_dm
     """
 
     inputs: jax.Array
     probabilities: jax.Array
     values: jax.Array
+    auxiliary_targets: jax.Array
 
 
 @jax.tree_util.register_dataclass
@@ -61,25 +64,35 @@ class TrainingBatch:
             - Index 3: orig [orig_q, orig_d, orig_m] (may contain NaN)
             - Index 4: root [root_q, root_d, root_m]
             - Index 5: st [q_st, d_st, NaN]
+        auxiliary_targets: Extra scalar training targets [batch, 1] where:
+            - Index 0: proven_best_dm
     """
 
     inputs: Union[jax.Array, jshard.NamedSharding]
     probabilities: Union[jax.Array, jshard.NamedSharding]
     values: Union[jax.Array, jshard.NamedSharding]
+    auxiliary_targets: Union[jax.Array, jshard.NamedSharding]
 
     @classmethod
     def from_tuple(
         cls, tensor_tuple: tuple[np.ndarray, ...]
     ) -> "TrainingBatch":
         """Create TrainingBatch from tuple returned by DataLoader."""
-        if len(tensor_tuple) != 3:
+        if len(tensor_tuple) not in (3, 4):
             raise ValueError(
-                f"Expected tuple of 3 tensors, got {len(tensor_tuple)}"
+                f"Expected tuple of 3 or 4 tensors, got {len(tensor_tuple)}"
             )
+        inputs = jnp.asarray(tensor_tuple[0])
+        auxiliary_targets = (
+            jnp.asarray(tensor_tuple[3])
+            if len(tensor_tuple) == 4
+            else jnp.zeros((inputs.shape[0], 1), dtype=jnp.float32)
+        )
         return cls(
-            inputs=jnp.asarray(tensor_tuple[0]),
+            inputs=inputs,
             probabilities=jnp.asarray(tensor_tuple[1]),
             values=jnp.asarray(tensor_tuple[2]),
+            auxiliary_targets=auxiliary_targets,
         )
 
 
