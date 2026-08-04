@@ -357,6 +357,14 @@ material_value_windows = executable(
   link_with : loader_lib,
 )
 
+dm_material_compensation = executable(
+  'dm_material_compensation',
+  'csrc/tools/dm_material_compensation_main.cc',
+  include_directories : includes,
+  dependencies : cli_deps + [zlib_dep],
+  link_with : loader_lib,
+)
+
 filter_chunks = executable(
   'filter_chunks',
   'csrc/tools/filter_chunks_main.cc',
