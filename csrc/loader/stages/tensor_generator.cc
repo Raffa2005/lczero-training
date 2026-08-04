@@ -147,7 +147,9 @@ TensorTuple TensorGenerator::ConvertFramesToTensors(
 
     // Index 4: root [root_q, root_d, root_m]
     auto root_slice = batch_slice.subspan(4 * kValuesPerType, kValuesPerType);
-    root_slice[0] = frame.root_q;
+    // WARNING: V6 root_q is stored in lc0's historical node convention. Keep
+    // the writer stable; normalize mid-doublemove roots only for training.
+    root_slice[0] = frame.is_mid_doublemove ? -frame.root_q : frame.root_q;
     root_slice[1] = frame.root_d;
     root_slice[2] = frame.root_m;
 

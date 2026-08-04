@@ -185,6 +185,25 @@ QueueBase* ChunkUnpacker::GetOutput(std::string_view name) {
 }
 
 namespace {
+bool IsDmRelevant(const FrameType& frame) {
+  return frame.is_mid_doublemove != 0 ||
+         frame.our_doublemove_available != 0 ||
+         frame.their_doublemove_available != 0;
+}
+
+std::vector<uint32_t> FilterPositions(std::vector<uint32_t> positions,
+                                      std::span<const FrameType> frames,
+                                      const ChunkUnpackerConfig& config) {
+  if (!config.require_dm_relevant()) return positions;
+  positions.erase(
+      std::remove_if(positions.begin(), positions.end(),
+                     [&](uint32_t index) {
+                       return !IsDmRelevant(frames[index]);
+                     }),
+      positions.end());
+  return positions;
+}
+
 std::vector<float> FramesToProbabilities(std::span<const FrameType> frames,
                                          const PositionSamplingConfig& config) {
   std::vector<float> probabilities;
@@ -234,6 +253,8 @@ void ChunkUnpacker::Worker(std::stop_token stop_token, ThreadContext* context) {
             config_.position_count() + config_.prefetch_count(),
             config_.position_count() * chunk.use_count, probabilities, gen);
       }
+      positions =
+          FilterPositions(std::move(positions), chunk.frames, config_);
 
       if (config_.has_prefetch_count()) {
         // Prefetch mode: output first position to primary, rest to prefetch.

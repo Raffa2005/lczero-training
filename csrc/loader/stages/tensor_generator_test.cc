@@ -389,6 +389,43 @@ TEST_F(TensorGeneratorTest, VerifiesQDConversion) {
   EXPECT_FLOAT_EQ(values_slice[1 * 3 + 1], 0.1f);   // best_d
 }
 
+TEST_F(TensorGeneratorTest, CorrectsMidDoublemoveRootQForTrainingTarget) {
+  config_.set_batch_size(2);
+  TensorGenerator generator(config_);
+  generator.SetInputs({input_queue_.get()});
+  generator.Start();
+
+  auto producer = input_queue_->CreateProducer();
+
+  FrameType normal = CreateTestFrame();
+  normal.root_q = 0.25f;
+  normal.root_d = 0.2f;
+  normal.root_m = 3.0f;
+  normal.is_mid_doublemove = 0;
+
+  FrameType mid_doublemove = normal;
+  mid_doublemove.is_mid_doublemove = 1;
+
+  producer.Put(normal);
+  producer.Put(mid_doublemove);
+  producer.Close();
+
+  auto tensors = generator.output_queue()->Get();
+  const auto* values_tensor =
+      dynamic_cast<const TypedTensor<float>*>(tensors[2].get());
+  ASSERT_NE(values_tensor, nullptr);
+
+  auto normal_values = values_tensor->slice({0});
+  EXPECT_FLOAT_EQ(normal_values[4 * 3 + 0], 0.25f);
+  EXPECT_FLOAT_EQ(normal_values[4 * 3 + 1], 0.2f);
+  EXPECT_FLOAT_EQ(normal_values[4 * 3 + 2], 3.0f);
+
+  auto mid_values = values_tensor->slice({1});
+  EXPECT_FLOAT_EQ(mid_values[4 * 3 + 0], -0.25f);
+  EXPECT_FLOAT_EQ(mid_values[4 * 3 + 1], 0.2f);
+  EXPECT_FLOAT_EQ(mid_values[4 * 3 + 2], 3.0f);
+}
+
 TEST_F(TensorGeneratorTest, GeneratesProofFocusAuxiliaryTargets) {
   config_.set_batch_size(5);
   TensorGenerator generator(config_);

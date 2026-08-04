@@ -173,6 +173,34 @@ TEST_F(ChunkUnpackerTest, HandlesEmptyChunk) {
   EXPECT_THROW(unpacker.output_queue()->Get(), QueueClosedException);
 }
 
+TEST_F(ChunkUnpackerTest, CanKeepOnlyDmRelevantPositions) {
+  config_.set_require_dm_relevant(true);
+  ChunkUnpacker unpacker(config_);
+  unpacker.SetInputs({input_queue_.get()});
+  unpacker.Start();
+
+  auto no_ability = CreateTestFrame(1);
+  auto our_ability = CreateTestFrame(2);
+  our_ability.our_doublemove_available = 1;
+  auto their_ability = CreateTestFrame(3);
+  their_ability.their_doublemove_available = 1;
+  auto mid_double = CreateTestFrame(4);
+  mid_double.is_mid_doublemove = 1;
+
+  auto producer = input_queue_->CreateProducer();
+  producer.Put(MakeChunk({no_ability, our_ability, their_ability, mid_double}));
+  producer.Close();
+
+  std::vector<uint32_t> actual_versions;
+  for (size_t i = 0; i < 3; ++i) {
+    actual_versions.push_back(unpacker.output_queue()->Get().version);
+  }
+  absl::c_sort(actual_versions);
+
+  EXPECT_EQ(actual_versions, (std::vector<uint32_t>{2, 3, 4}));
+  EXPECT_THROW(unpacker.output_queue()->Get(), QueueClosedException);
+}
+
 TEST_F(ChunkUnpackerTest, HandlesQueueClosure) {
   ChunkUnpacker unpacker(config_);
   unpacker.SetInputs({input_queue_.get()});

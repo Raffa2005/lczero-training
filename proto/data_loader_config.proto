@@ -133,6 +133,10 @@ message ChunkUnpackerConfig {
   optional QueueConfig prefetch_output = 6;
 
   optional PositionSamplingConfig position_sampling = 7;
+  // When true, discard positions where both players have already spent their
+  // double-move ability. This is intended for DM-only student/MoE training
+  // where ordinary post-burn chess is handled by another route.
+  optional bool require_dm_relevant = 8;
 }
 
 // Configuration for shuffling frame sampler using reservoir sampling.
