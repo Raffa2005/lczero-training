@@ -1,4 +1,5 @@
 from functools import partial
+from pathlib import PurePosixPath
 from typing import Any
 
 import jax
@@ -56,20 +57,25 @@ def _path_parts(path: tuple[object, ...]) -> tuple[str, ...]:
 def _trains_embedding_kernel(config: OptimizerConfig) -> bool:
     if not config.HasField("freeze_selector"):
         return False
-    return any(
-        rule.match == "embedding/embedding/kernel" and not rule.include
-        for rule in config.freeze_selector.rule
-    )
+    path = PurePosixPath("embedding/embedding/kernel")
+    for rule in config.freeze_selector.rule:
+        if path.full_match(rule.match):
+            return not rule.include
+    return not config.freeze_selector.otherwise_include
 
 
-def _mask_ability_embedding_rows() -> optax.GradientTransformation:
-    """Keep only v13 ability-plane embedding rows trainable.
+def _mask_embedding_kernel_rows(
+    *, train_all_rows: bool
+) -> optax.GradientTransformation:
+    """Apply the configured row-level input projection protection.
 
     The protobuf selector can only include/exclude whole leaves.  For v13
     shielded warmup we need the embedding kernel leaf to be trainable, but
     only rows 112-113 correspond to the new double-move input planes.  Masking
     gradients before clipping/Adam keeps all pretrained input and dense
-    positional rows exactly frozen and prevents optimizer moments from drifting.
+    positional rows exactly frozen and prevents optimizer moments from
+    drifting. Full input unfreeze keeps this transformation in the optimizer
+    chain but makes it an identity, preserving checkpoint-state structure.
     """
 
     def init_fn(params: optax.Params) -> optax.EmptyState:
@@ -78,6 +84,8 @@ def _mask_ability_embedding_rows() -> optax.GradientTransformation:
 
     def mask_update(path: tuple[object, ...], update: jax.Array) -> jax.Array:
         if _path_parts(path) != _EMBEDDING_KERNEL_PATH:
+            return update
+        if train_all_rows:
             return update
         if update.ndim != 2 or update.shape[0] < _ABILITY_EMBEDDING_ROW_STOP:
             raise ValueError(
@@ -142,7 +150,14 @@ def make_gradient_transformation(
     if max_grad_norm is not None and max_grad_norm > 0:
         tx = optax.chain(optax.clip_by_global_norm(max_grad_norm), tx)
     if _trains_embedding_kernel(config):
-        tx = optax.chain(_mask_ability_embedding_rows(), tx)
+        tx = optax.chain(
+            _mask_embedding_kernel_rows(
+                train_all_rows=(
+                    config.embedding_kernel_row_mode == OptimizerConfig.ALL_ROWS
+                )
+            ),
+            tx,
+        )
     if config.HasField("freeze_selector"):
         freeze_mask = partial(make_weights_mask, config.freeze_selector)
 

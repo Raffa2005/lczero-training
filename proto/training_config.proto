@@ -22,6 +22,14 @@ message ScheduleConfig {
 }
 
 message OptimizerConfig {
+  enum EmbeddingKernelRowMode {
+    // Preserve the pretrained standard and dense-positional input rows while
+    // training only the two double-move ability rows (112 and 113).
+    ABILITY_ROWS_ONLY = 0;
+    // Train every row of the input projection kernel.
+    ALL_ROWS = 1;
+  }
+
   oneof optimizer_type {
     NadamwOptimizerConfig nadamw = 1;
     NadamOptimizerConfig nadam = 2;
@@ -30,6 +38,9 @@ message OptimizerConfig {
   // When set, weights selected by this selector are frozen (no gradient
   // updates).
   WeightsSelector freeze_selector = 4;
+  // Row-level behavior when the input projection kernel is trainable. The
+  // default retains the protected warm-start behavior used by v13-v38.
+  EmbeddingKernelRowMode embedding_kernel_row_mode = 5;
 }
 
 message LrSchedule {
