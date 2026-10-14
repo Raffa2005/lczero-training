@@ -1,0 +1,147 @@
+import dataclasses
+import logging
+from typing import Optional, cast
+
+import numpy as np
+from flax import nnx
+
+from lczero_training.convert.leela_pytree_visitor import (
+    LeelaPytreeWeightsVisitor,
+)
+from proto import net_pb2
+
+logger = logging.getLogger(__name__)
+
+_EMBEDDING_PLANE_TO_SCALE = 109
+_EMBEDDING_SCALE = 99.0
+
+
+class JaxToLeela(LeelaPytreeWeightsVisitor):
+    def embedding_block(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights
+    ) -> None:
+        embedding_kernel = cast(nnx.Param, nnx_dict["embedding"]["kernel"])
+        original_values = embedding_kernel.value
+        arr = np.asarray(original_values).copy()
+        arr[_EMBEDDING_PLANE_TO_SCALE] /= _EMBEDDING_SCALE
+        embedding_kernel.value = arr
+        try:
+            super().embedding_block(nnx_dict=nnx_dict, weights=weights)
+        finally:
+            embedding_kernel.value = original_values
+
+    def tensor(
+        self,
+        param: nnx.Param,
+        leela: net_pb2.Weights.Layer,
+    ) -> None:
+        weights = np.asarray(param.value, dtype=np.float32).T.flatten()
+        min_val, max_val = np.min(weights), np.max(weights)
+        range_val = max_val - min_val
+
+        # Normalize to [0, 1], handling the case where all weights are equal.
+        normalized = np.where(
+            range_val > 1e-8, (weights - min_val) / range_val, 0.5
+        )
+
+        # Scale to uint16 and convert to bytes.
+        quantized = np.round(normalized * 65535.0).astype(np.uint16)
+        leela.params = quantized.tobytes()
+        leela.min_val = float(min_val)
+        leela.max_val = float(max_val)
+
+        assert len(leela.params) // 2 == weights.size
+
+    def encoder_tower(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights
+    ) -> None:
+        for i in range(len(nnx_dict["encoders"]["layers"])):
+            weights.encoder.append(weights.EncoderLayer())
+        return super().encoder_tower(nnx_dict=nnx_dict, weights=weights)
+
+    def policy_head(
+        self, nnx_dict: nnx.State, weights: net_pb2.Weights.PolicyHead
+    ) -> None:
+        if "tokens" in nnx_dict:
+            self.matmul(nnx_dict["tokens"], weights.ip_pol_w, weights.ip_pol_b)
+        self.matmul(nnx_dict["q"], weights.ip2_pol_w, weights.ip2_pol_b)
+        self.matmul(nnx_dict["k"], weights.ip3_pol_w, weights.ip3_pol_b)
+        self.matmul(nnx_dict["promotion_dense"], weights.ip4_pol_w, None)
+        if "q_ab" in nnx_dict:
+            self.matmul(
+                nnx_dict["q_ab"], weights.ip2_pol_ab_w, weights.ip2_pol_ab_b
+            )
+            self.matmul(
+                nnx_dict["k_ab"], weights.ip3_pol_ab_w, weights.ip3_pol_ab_b
+            )
+            self.matmul(
+                nnx_dict["promotion_dense_ab"], weights.ip4_pol_ab_w, None
+            )
+        if "gate_embed" in nnx_dict:
+            self.matmul(
+                nnx_dict["gate_embed"],
+                weights.ip_pol_gate_w,
+                weights.ip_pol_gate_b,
+            )
+            self.matmul(
+                nnx_dict["gate_dense1"],
+                weights.ip2_pol_gate_w,
+                weights.ip2_pol_gate_b,
+            )
+
+
+@dataclasses.dataclass
+class LeelaExportOptions:
+    min_version: str
+    num_heads: int
+    license: Optional[str]
+    training_steps: Optional[int] = None
+
+
+def jax_to_leela(
+    jax_weights: nnx.State, export_options: LeelaExportOptions
+) -> net_pb2.Net:
+    lc0_weights = net_pb2.Net()
+    lc0_weights.magic = 0x1C0
+    if export_options.license:
+        lc0_weights.license = export_options.license
+    (
+        lc0_weights.min_version.major,
+        lc0_weights.min_version.minor,
+        lc0_weights.min_version.patch,
+    ) = _split_version(export_options.min_version)
+    lc0_weights.format.CopyFrom(_make_format())
+    if export_options.training_steps is not None:
+        lc0_weights.training_params.training_steps = (
+            export_options.training_steps
+        )
+
+    visitor = JaxToLeela(jax_weights, lc0_weights)
+    lc0_weights.weights.headcount = export_options.num_heads
+    visitor.run()
+
+    return lc0_weights
+
+
+def _split_version(version_str: str) -> tuple[int, int, int]:
+    """Splits a version string like "v12.34.56" into (12, 34, 56)."""
+    parts = (version_str.lstrip("v").split(".") + ["0", "0"])[:3]
+    return cast(tuple[int, int, int], tuple(map(int, parts)))
+
+
+def _make_format() -> net_pb2.Format:
+    fmt = net_pb2.Format()
+    fmt.weights_encoding = fmt.LINEAR16
+    netfmt = fmt.network_format
+    netfmt.input = netfmt.INPUT_CLASSICAL_112_PLANE
+    netfmt.output = netfmt.OUTPUT_WDL
+    netfmt.network = netfmt.NETWORK_ATTENTIONBODY_WITH_MULTIHEADFORMAT
+    netfmt.policy = netfmt.POLICY_ATTENTION
+    netfmt.value = netfmt.VALUE_WDL
+    netfmt.moves_left = netfmt.MOVES_LEFT_V1
+    netfmt.default_activation = netfmt.DEFAULT_ACTIVATION_MISH
+    netfmt.smolgen_activation = netfmt.ACTIVATION_NONE
+    netfmt.ffn_activation = netfmt.ACTIVATION_DEFAULT
+    netfmt.input_embedding = netfmt.INPUT_EMBEDDING_PE_DENSE
+
+    return fmt

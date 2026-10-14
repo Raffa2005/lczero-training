@@ -1,0 +1,495 @@
+from typing import Dict, List, Optional, Sequence, Tuple, Union, cast
+
+import jax
+import jax.numpy as jnp
+import optax
+from flax import nnx
+from jax.scipy.special import xlogy
+
+from lczero_training.training.state import TrainingSample
+from lczero_training.training.utils import make_weights_mask
+from proto.training_config_pb2 import (
+    LossConfig,
+    MovesLeftLossConfig,
+    PolicyLossConfig,
+    RegularizationLossConfig,
+    ValueCategoricalLossConfig,
+    ValueErrorLossConfig,
+    ValueLossConfig,
+)
+
+from .model import LczeroModel, ModelPrediction
+from .policy_head import PolicyHeadOutput
+
+
+def _compute_q_from_wdl(wdl_logits: jax.Array) -> jax.Array:
+    """Compute Q value from WDL logits."""
+    wdl_probs = jax.nn.softmax(wdl_logits)
+    q_weights = jnp.array([1.0, 0.0, -1.0])
+    return jnp.dot(wdl_probs, q_weights)
+
+
+class LossBase:
+    def __init__(
+        self,
+        config: Union[
+            PolicyLossConfig,
+            ValueLossConfig,
+            MovesLeftLossConfig,
+            ValueErrorLossConfig,
+            ValueCategoricalLossConfig,
+        ],
+    ) -> None:
+        self.head_name = config.head_name
+        self.metric_name = config.metric_name or config.head_name
+        self.weight = config.weight
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        raise NotImplementedError("Subclasses must implement __call__")
+
+
+class RegularizationLoss:
+    """Computes regularization loss on model parameters."""
+
+    def __init__(self, config: RegularizationLossConfig) -> None:
+        self.metric_name = config.metric_name or "l2"
+        self.weight = config.weight
+        self._selector = config.selector
+
+    def __call__(self, model: LczeroModel) -> jax.Array:
+        params = nnx.state(model, nnx.Param)
+        mask = make_weights_mask(self._selector, params)
+        masked_params = jax.tree.map(
+            lambda p, m: p.value if m else jnp.zeros_like(p.value),
+            params,
+            mask,
+            is_leaf=lambda x: isinstance(x, nnx.Variable),
+        )
+        leaves = jax.tree.leaves(masked_params)
+        return sum(
+            (jnp.sum(jnp.square(leaf)) for leaf in leaves), jnp.array(0.0)
+        )
+
+
+class LczeroLoss:
+    policy_losses: List["PolicyLoss"]
+    value_losses: List["ValueLoss"]
+    movesleft_losses: List["MovesLeftLoss"]
+    value_error_losses: List["ValueErrorLoss"]
+    value_categorical_losses: List["ValueCategoricalLoss"]
+    regularization_losses: List["RegularizationLoss"]
+
+    def __init__(self, config: LossConfig) -> None:
+        self.config = config
+        self.policy_losses = [
+            PolicyLoss(loss_config) for loss_config in config.policy
+        ]
+        self.value_losses = [
+            ValueLoss(loss_config) for loss_config in config.value
+        ]
+        self.movesleft_losses = [
+            MovesLeftLoss(loss_config) for loss_config in config.movesleft
+        ]
+        self.value_error_losses = [
+            ValueErrorLoss(loss_config) for loss_config in config.value_error
+        ]
+        self.value_categorical_losses = [
+            ValueCategoricalLoss(loss_config)
+            for loss_config in config.value_categorical
+        ]
+        self.regularization_losses = [
+            RegularizationLoss(loss_config)
+            for loss_config in config.regularization
+        ]
+
+        def _validate_no_duplicate_metrics(
+            loss_type_name: str,
+            losses: Sequence[Union[LossBase, RegularizationLoss]],
+        ) -> None:
+            seen = set()
+            for name in (loss.metric_name for loss in losses):
+                if name in seen:
+                    raise ValueError(
+                        f"Duplicate metric name: {loss_type_name}/{name}"
+                    )
+                seen.add(name)
+
+        _validate_no_duplicate_metrics("policy", self.policy_losses)
+        _validate_no_duplicate_metrics("value", self.value_losses)
+        _validate_no_duplicate_metrics("movesleft", self.movesleft_losses)
+        _validate_no_duplicate_metrics("value_error", self.value_error_losses)
+        _validate_no_duplicate_metrics(
+            "value_categorical", self.value_categorical_losses
+        )
+        _validate_no_duplicate_metrics(
+            "regularization", self.regularization_losses
+        )
+
+    def __call__(
+        self,
+        model: LczeroModel,
+        sample: TrainingSample,
+    ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+        predictions = model(sample.inputs)
+
+        unweighted_losses: Dict[str, jax.Array] = {}
+        weighted_losses: List[jax.Array] = []
+
+        for policy_loss in self.policy_losses:
+            loss = policy_loss(predictions, sample)
+            unweighted_losses[f"policy/{policy_loss.metric_name}"] = loss
+            weighted_losses.append(loss * policy_loss.weight)
+
+        for value_loss in self.value_losses:
+            loss = value_loss(predictions, sample)
+            unweighted_losses[f"value/{value_loss.metric_name}"] = loss
+            weighted_losses.append(loss * value_loss.weight)
+
+        for movesleft_loss in self.movesleft_losses:
+            loss = movesleft_loss(predictions, sample)
+            unweighted_losses[f"movesleft/{movesleft_loss.metric_name}"] = loss
+            weighted_losses.append(loss * movesleft_loss.weight)
+
+        for value_error_loss in self.value_error_losses:
+            loss = value_error_loss(predictions, sample)
+            unweighted_losses[f"value_error/{value_error_loss.metric_name}"] = (
+                loss
+            )
+            weighted_losses.append(loss * value_error_loss.weight)
+
+        for value_categorical_loss in self.value_categorical_losses:
+            loss = value_categorical_loss(predictions, sample)
+            unweighted_losses[
+                f"value_categorical/{value_categorical_loss.metric_name}"
+            ] = loss
+            weighted_losses.append(loss * value_categorical_loss.weight)
+
+        for reg_loss in self.regularization_losses:
+            loss = reg_loss(model)
+            unweighted_losses[f"regularization/{reg_loss.metric_name}"] = loss
+            weighted_losses.append(loss * reg_loss.weight)
+
+        data_loss = jnp.sum(jnp.array(weighted_losses))
+
+        return data_loss, unweighted_losses
+
+
+class ValueLoss(LossBase):
+    def __init__(self, config: ValueLossConfig) -> None:
+        super().__init__(config)
+        self.value_type = config.value_type
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        value_pred = predictions.value[self.head_name]
+        value_logits = value_pred[0]
+        # Extract raw q/d from sample and compute WDL.
+        value_q = sample.values[self.value_type, 0]
+        value_d = sample.values[self.value_type, 1]
+        # Compute WDL: w = (1 + q - d) / 2, l = (1 - q - d) / 2
+        value_w = (1.0 + value_q - value_d) / 2.0
+        value_l = (1.0 - value_q - value_d) / 2.0
+        value_wdl = jnp.stack([value_w, value_d, value_l], axis=-1)
+
+        # The cross-entropy between the predicted value and the target value.
+        value_cross_entropy = optax.softmax_cross_entropy(
+            logits=value_logits, labels=jax.lax.stop_gradient(value_wdl)
+        )
+        assert isinstance(value_cross_entropy, jax.Array)
+        return value_cross_entropy
+
+
+class PolicyLoss(LossBase):
+    def __init__(self, config: PolicyLossConfig):
+        super().__init__(config)
+        self.config = config
+        if config.type == PolicyLossConfig.LOSS_TYPE_UNSPECIFIED:
+            raise ValueError(
+                f"Policy loss type must be specified for head '{config.head_name}'."
+            )
+        self._loss_type = config.type
+        temperature = config.temperature
+        if temperature <= 0:
+            temperature = 1.0
+        self._temperature = temperature
+        self._burn_focus_alpha = config.burn_focus_alpha
+        self._burn_focus_max_weight = config.burn_focus_max_weight
+        self._proof_focus_weight = config.proof_focus_weight
+
+        # Store optimistic config if present.
+        if config.HasField("optimistic"):
+            opt = config.optimistic
+            self.opt_value_head: Optional[str] = opt.value_head_name
+            self.opt_value_type = opt.value_type
+            self.opt_strength = opt.strength
+            self.opt_eps = opt.eps
+            self.opt_alpha = opt.alpha
+            self.opt_propagate_gradients = opt.propagate_value_gradients
+        else:
+            self.opt_value_head = None
+
+    def _apply_temperature_and_normalize(
+        self, policy_targets: jax.Array
+    ) -> jax.Array:
+        if self._temperature != 1.0:
+            policy_targets = jnp.power(policy_targets, 1.0 / self._temperature)
+
+        target_sum = jnp.sum(policy_targets, axis=-1, keepdims=True)
+        safe_sum = jnp.where(
+            target_sum > 0, target_sum, jnp.ones_like(target_sum)
+        )
+        return policy_targets / safe_sum
+
+    def _compute_optimistic_weight(
+        self,
+        value_pred: Tuple[jax.Array, Optional[jax.Array], Optional[jax.Array]],
+        target_q: jax.Array,
+    ) -> jax.Array:
+        """Compute optimistic policy weight from value head predictions."""
+        wdl_logits = value_pred[0]
+        error_pred = value_pred[1]
+        assert error_pred is not None, (
+            "Error prediction required for optimistic weighting"
+        )
+
+        # Optionally block gradients to value and error heads.
+        if not self.opt_propagate_gradients:
+            wdl_logits = jax.lax.stop_gradient(wdl_logits)
+            error_pred = jax.lax.stop_gradient(error_pred)
+
+        # Compute predicted Q from WDL.
+        q_pred = _compute_q_from_wdl(wdl_logits)
+
+        # Compute sigma and z-score.
+        sigma = jnp.sqrt(error_pred.squeeze())
+        z = (target_q - q_pred) / (sigma + self.opt_eps)
+
+        # Compute weight.
+        return jax.nn.sigmoid((z - self.opt_strength) * self.opt_alpha)
+
+    def _compute_policy_loss(
+        self, policy_pred: jax.Array, policy_targets: jax.Array
+    ) -> jax.Array:
+        cross_entropy = cast(
+            jax.Array,
+            optax.safe_softmax_cross_entropy(
+                logits=policy_pred, labels=policy_targets
+            ),
+        )
+        if self._loss_type == PolicyLossConfig.CROSS_ENTROPY:
+            return cross_entropy
+        if self._loss_type == PolicyLossConfig.KL:
+            return cross_entropy + jnp.sum(
+                xlogy(policy_targets, policy_targets), axis=-1
+            )
+        raise AssertionError(f"Unknown policy loss type: {self._loss_type}.")
+
+    def _compute_split_policy_loss(
+        self,
+        policy_pred: PolicyHeadOutput,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        policy_targets = jnp.asarray(
+            sample.probabilities, dtype=policy_pred.normal_logits.dtype
+        )
+        policy_targets = jax.nn.relu(policy_targets)
+
+        normal_targets_raw = policy_targets[:1858]
+        ability_targets_raw = policy_targets[1858:]
+
+        total_target = jnp.sum(policy_targets)
+        safe_total = jnp.maximum(total_target, 1e-8)
+        burn_frac = jnp.sum(ability_targets_raw) / safe_total
+        normal_frac = jnp.sum(normal_targets_raw) / safe_total
+
+        normal_targets = self._apply_temperature_and_normalize(
+            normal_targets_raw
+        )
+        ability_targets = self._apply_temperature_and_normalize(
+            ability_targets_raw
+        )
+
+        normal_logits = policy_pred.normal_logits
+        ability_logits = policy_pred.ability_logits
+        if self.config.illegal_moves == PolicyLossConfig.MASK:
+            normal_logits = jnp.where(
+                sample.probabilities[:1858] >= 0, normal_logits, -jnp.inf
+            )
+            ability_logits = jnp.where(
+                sample.probabilities[1858:] >= 0, ability_logits, -jnp.inf
+            )
+
+        gate_target = jax.lax.stop_gradient(burn_frac)
+        gate_loss = optax.sigmoid_binary_cross_entropy(
+            policy_pred.gate_logit, gate_target
+        )
+
+        can_burn = sample.inputs[112, 0, 0]
+        gate_loss = gate_loss * can_burn
+
+        normal_loss = normal_frac * self._compute_policy_loss(
+            normal_logits, normal_targets
+        )
+        ability_loss = burn_frac * self._compute_policy_loss(
+            ability_logits, ability_targets
+        )
+        if self._burn_focus_alpha > 0:
+            focus_weight = 1.0 + self._burn_focus_alpha * jnp.square(
+                jax.lax.stop_gradient(burn_frac)
+            )
+            if self._burn_focus_max_weight > 0:
+                focus_weight = jnp.minimum(
+                    focus_weight, self._burn_focus_max_weight
+                )
+            gate_loss = gate_loss * focus_weight
+            ability_loss = ability_loss * focus_weight
+        if self._proof_focus_weight > 0:
+            proven_best_dm = jax.lax.stop_gradient(sample.auxiliary_targets[0])
+            proof_gate_loss = optax.sigmoid_binary_cross_entropy(
+                policy_pred.gate_logit,
+                jnp.ones_like(policy_pred.gate_logit),
+            )
+            gate_loss = gate_loss + (
+                self._proof_focus_weight
+                * proven_best_dm
+                * can_burn
+                * proof_gate_loss
+            )
+        return gate_loss + normal_loss + ability_loss
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        policy_pred = predictions.policy[self.head_name]
+        if isinstance(policy_pred, PolicyHeadOutput):
+            loss = self._compute_split_policy_loss(policy_pred, sample)
+        else:
+            policy_targets = jnp.asarray(
+                sample.probabilities, dtype=policy_pred.dtype
+            )
+            if self.config.illegal_moves == PolicyLossConfig.MASK:
+                policy_pred = jnp.where(
+                    policy_targets >= 0, policy_pred, -jnp.inf
+                )
+
+            policy_targets = jax.nn.relu(policy_targets)
+            policy_targets = self._apply_temperature_and_normalize(
+                policy_targets
+            )
+            loss = self._compute_policy_loss(policy_pred, policy_targets)
+
+        # Apply optimistic weighting if configured.
+        if self.opt_value_head is not None:
+            value_pred = predictions.value[self.opt_value_head]
+            target_q = sample.values[self.opt_value_type, 0]
+            loss = loss * self._compute_optimistic_weight(value_pred, target_q)
+
+        return loss
+
+
+class MovesLeftLoss(LossBase):
+    def __init__(self, config: MovesLeftLossConfig) -> None:
+        super().__init__(config)
+        self.value_type = config.value_type
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        movesleft_pred = predictions.movesleft[self.head_name]
+        # Extract movesleft from sample.
+        # sample.values shape: [6, 3], component 2 is movesleft.
+        movesleft_targets = sample.values[self.value_type, 2]
+
+        # Scale the loss to similar range as other losses.
+        scale = 20.0
+        targets = movesleft_targets / scale
+        scaled_predictions = movesleft_pred / scale
+
+        # Huber loss
+        huber_loss = optax.huber_loss(
+            predictions=scaled_predictions, targets=targets, delta=10.0 / scale
+        )
+        assert isinstance(huber_loss, jax.Array)
+        return huber_loss.squeeze()
+
+
+class ValueErrorLoss(LossBase):
+    def __init__(self, config: ValueErrorLossConfig) -> None:
+        super().__init__(config)
+        self.value_type = config.value_type
+        self.propagate_value_gradients = config.propagate_value_gradients
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        value_pred = predictions.value[self.head_name]
+        wdl_logits = value_pred[0]
+        error_pred = value_pred[1]
+        assert error_pred is not None
+
+        # Convert WDL to Q value.
+        predicted_q = _compute_q_from_wdl(wdl_logits)
+
+        # Get target Q value.
+        target_q = sample.values[self.value_type, 0]
+
+        # Compute actual squared error.
+        actual_squared_error = jnp.square(predicted_q - target_q)
+
+        # Optionally block gradients to WDL head.
+        if not self.propagate_value_gradients:
+            actual_squared_error = jax.lax.stop_gradient(actual_squared_error)
+
+        # MSE between error prediction and actual error.
+        loss = jnp.square(error_pred - actual_squared_error)
+
+        return loss.squeeze()
+
+
+class ValueCategoricalLoss(LossBase):
+    def __init__(self, config: ValueCategoricalLossConfig) -> None:
+        super().__init__(config)
+        self.value_type = config.value_type
+
+    def __call__(
+        self,
+        predictions: ModelPrediction,
+        sample: TrainingSample,
+    ) -> jax.Array:
+        value_pred = predictions.value[self.head_name]
+        categorical_logits = value_pred[2]
+        assert categorical_logits is not None
+
+        # Get target Q value from sample.
+        target_q = sample.values[self.value_type, 0]
+
+        # Convert Q to bucket index: map [-1, 1) to [0, num_buckets).
+        num_buckets = categorical_logits.shape[-1]
+        bucket_index = jnp.floor((target_q + 1.0) / 2.0 * num_buckets).astype(
+            jnp.int32
+        )
+        bucket_index = jnp.clip(bucket_index, 0, num_buckets - 1)
+
+        # Create one-hot target.
+        target_one_hot = jax.nn.one_hot(bucket_index, num_buckets)
+
+        # Compute softmax cross-entropy.
+        loss = optax.softmax_cross_entropy(
+            logits=categorical_logits,
+            labels=jax.lax.stop_gradient(target_one_hot),
+        )
+        assert isinstance(loss, jax.Array)
+        return loss

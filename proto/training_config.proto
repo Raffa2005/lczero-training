@@ -1,0 +1,222 @@
+syntax = "proto3";
+
+package lczero.training;
+
+// Configuration for training algorithm and parameters.
+message TrainingConfig {
+  ScheduleConfig schedule = 1;
+  repeated LrSchedule lr_schedule = 2;
+  CheckpointConfig checkpoint = 3;
+  OptimizerConfig optimizer = 4;
+  LossConfig losses = 5;
+  // Maximum gradient norm; set to 0 or omit to disable clipping.
+  float max_grad_norm = 6;
+  // Stochastic Weight Averaging (SWA) configuration. When absent, SWA is
+  // disabled.
+  SWAConfig swa = 7;
+}
+
+message ScheduleConfig {
+  int32 steps_per_network = 1;
+  int32 chunks_per_network = 2;
+}
+
+message OptimizerConfig {
+  enum EmbeddingKernelRowMode {
+    // Preserve the pretrained standard and dense-positional input rows while
+    // training only the two double-move ability rows (112 and 113).
+    ABILITY_ROWS_ONLY = 0;
+    // Train every row of the input projection kernel.
+    ALL_ROWS = 1;
+    // Train the mid-double indicator (110) and ability rights (112, 113).
+    VARIANT_ROWS_ONLY = 2;
+  }
+
+  oneof optimizer_type {
+    NadamwOptimizerConfig nadamw = 1;
+    NadamOptimizerConfig nadam = 2;
+    SgdOptimizerConfig sgd = 3;
+  }
+  // When set, weights selected by this selector are frozen (no gradient
+  // updates).
+  WeightsSelector freeze_selector = 4;
+  // Row-level behavior when the input projection kernel is trainable. The
+  // default retains the protected warm-start behavior used by v13-v38.
+  EmbeddingKernelRowMode embedding_kernel_row_mode = 5;
+}
+
+message LrSchedule {
+  // Optimizer step when this schedule becomes active.
+  int32 starting_step = 1;
+  // Duration of each interval while this schedule is active. Last entry may be
+  // zero to indicate an open-ended tail.
+  repeated uint32 duration_steps = 2;
+  // Learning rate at the beginning of each interval.
+  repeated float lr = 3;
+  enum Transition {
+    CONSTANT = 0;
+    LINEAR = 1;
+    COSINE = 2;
+  }
+  // Transition type to use for each interval. Missing entries default to
+  // CONSTANT.
+  repeated Transition transition = 4;
+  // When true this schedule loops after finishing the final interval.
+  bool loop = 5;
+}
+
+message NadamwOptimizerConfig {
+  float beta_1 = 1;
+  float beta_2 = 2;
+  float epsilon = 3;
+  float weight_decay = 4;
+  // Selector for weight decay. True = apply decay to this category.
+  WeightsSelector decay_selector = 5;
+}
+
+message NadamOptimizerConfig {
+  float beta_1 = 1;
+  float beta_2 = 2;
+  float epsilon = 3;
+}
+
+message SgdOptimizerConfig {
+  float momentum = 1;
+  bool nesterov = 2;
+}
+
+message WeightsSelectorRule {
+  // Glob pattern matched against weight path.
+  string match = 1;
+  // True = include; false = exclude.
+  bool include = 2;
+}
+
+// Selector for which weight categories to include.
+// Rules are evaluated in order; the first matching rule applies.
+// If no rule matches, otherwise_include is used.
+message WeightsSelector {
+  repeated WeightsSelectorRule rule = 1;
+  bool otherwise_include = 2;
+}
+
+message CheckpointConfig {
+  string path = 1;
+  int32 max_to_keep = 2;
+}
+
+message LossConfig {
+  repeated PolicyLossConfig policy = 1;
+  repeated ValueLossConfig value = 2;
+  repeated MovesLeftLossConfig movesleft = 3;
+  repeated ValueErrorLossConfig value_error = 4;
+  repeated ValueCategoricalLossConfig value_categorical = 5;
+  repeated RegularizationLossConfig regularization = 6;
+}
+
+message RegularizationLossConfig {
+  enum RegularizationType {
+    L2 = 0;
+  }
+  RegularizationType type = 1;
+  string metric_name = 2;
+  float weight = 3;
+  // Selector for which weights to regularize. True = include in regularization.
+  WeightsSelector selector = 4;
+}
+
+enum ValueType {
+  RESULT = 0;
+  BEST = 1;
+  PLAYED = 2;
+  ORIG = 3;
+  ROOT = 4;
+  ST = 5;
+}
+
+message OptimisticPolicyConfig {
+  // Name of the value head to use for optimism computation.
+  string value_head_name = 1;
+  // Which value type to use from the training sample.
+  ValueType value_type = 2;
+  // Z-score threshold for optimism (e.g. 2.0).
+  float strength = 3;
+  // Epsilon for numerical stability (e.g. 1e-5).
+  float eps = 4;
+  // Sigmoid scaling factor (e.g. 3.0).
+  float alpha = 5;
+  // If false, prevent gradients from flowing to value and error heads.
+  bool propagate_value_gradients = 6;
+}
+
+message PolicyLossConfig {
+  string head_name = 1;
+  string metric_name = 2;
+  float weight = 3;
+  enum IllegalMoveHandling {
+    TRAIN_TO_ZERO = 0;
+    MASK = 1;
+  }
+  IllegalMoveHandling illegal_moves = 4;
+  enum LossType {
+    LOSS_TYPE_UNSPECIFIED = 0;
+    CROSS_ENTROPY = 1;
+    KL = 2;
+  }
+  // Selects which policy loss implementation to use. Must be specified.
+  LossType type = 5;
+  // Soft policy temperature applied before normalizing targets for KL loss.
+  // Values <= 0 disable the adjustment and keep raw targets.
+  float temperature = 6;
+  OptimisticPolicyConfig optimistic = 7;
+  // Optional focus weighting for split double-move policy losses.
+  //
+  // When burn_focus_alpha > 0, the split-policy implementation multiplies
+  // only the burn gate BCE and ability-branch CE by:
+  //   min(burn_focus_max_weight, 1 + burn_focus_alpha * burn_frac^2)
+  // The normal policy branch is intentionally left unweighted.
+  float burn_focus_alpha = 8;
+  // Values <= 0 disable the cap.
+  float burn_focus_max_weight = 9;
+  // Optional positive-only gate loss for positions where search proved a
+  // double-move best move. The target is p_burn=1 and the normal policy target
+  // is left unchanged. Values <= 0 disable it.
+  float proof_focus_weight = 10;
+}
+
+message ValueLossConfig {
+  string head_name = 1;
+  string metric_name = 2;
+  float weight = 3;
+  ValueType value_type = 4;
+}
+
+message MovesLeftLossConfig {
+  string head_name = 1;
+  string metric_name = 2;
+  float weight = 3;
+  ValueType value_type = 4;
+}
+
+message ValueErrorLossConfig {
+  string head_name = 1;
+  string metric_name = 2;
+  float weight = 3;
+  ValueType value_type = 4;
+  bool propagate_value_gradients = 5;
+}
+
+message ValueCategoricalLossConfig {
+  string head_name = 1;
+  string metric_name = 2;
+  float weight = 3;
+  ValueType value_type = 4;
+}
+
+// Stochastic Weight Averaging configuration.
+message SWAConfig {
+  // Number of steps between SWA updates.
+  uint32 period_steps = 1;
+  // Maximum effective number of model snapshots to average.
+  uint32 num_averages = 2;
+}
