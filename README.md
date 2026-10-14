@@ -47,6 +47,6 @@ uv run pytest
 ## Attribution
 
 The upstream training implementation is by the Leela Chess Zero contributors.
-Rafael Sabirov's original Double Strike Chess modifications are offered under
+Our original Double Strike Chess modifications are offered under
 `LICENSE-CONTRIBUTIONS`. That grant covers those contributions only and does
 not relicense upstream files. The nested lc0 source retains its GPL license.
